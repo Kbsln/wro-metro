@@ -1,0 +1,11 @@
+pandas>=2.2
+numpy>=1.26
+geopandas>=0.14
+shapely>=2.0
+matplotlib>=3.8
+requests>=2.31
+jupyterlab>=4.0
+notebook>=7.0
+nbconvert>=7.0
+contextily>=1.6
+xyzservices>=2024.9
