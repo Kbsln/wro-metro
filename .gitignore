@@ -1,8 +1,17 @@
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
+.DS_Store
 .venv/
 venv/
 outputs/
 data/processed/
 data/raw/*.zip
+data/raw/*.geojson
+!data/raw/geology.geojson
+data/raw/*.gpkg
+data/raw/*.shp
+data/raw/*.shx
+data/raw/*.dbf
+data/raw/*.prj
+data/raw/*.cpg

@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: clean-notebooks
+        name: clean Jupyter notebook outputs and volatile metadata
+        entry: python scripts/clean_notebooks.py
+        language: python
+        files: ^notebooks/.*\.ipynb$
+        pass_filenames: true

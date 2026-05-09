@@ -20,7 +20,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 from shapely.geometry import LineString, Point, box
-from shapely.ops import unary_union
+from shapely.ops import nearest_points, unary_union
 
 WGS84 = 4326
 LOCAL_CRS = 2177
@@ -37,9 +37,13 @@ class MetroConfig:
     station_count: int = WARSAW_M1_STATIONS
     walk_radius_m: float = 800.0
     cost_per_km_mln: float = 650.0
+    flood_cost_multiplier: float = 2.0
     angle_step_deg: float = 2.0
     forbidden_penalty_per_km: float = 2_500.0
+    outside_city_penalty_per_km: float = 120_000.0
+    # Legacy flat penalty kept for older notebook variants.
     geology_penalty: float = 1_000.0
+    geology_penalty_per_km: float = 1_000.0
     river_crossing_bonus_per_km: float = 600.0
     transfer_bonus_per_interchange: float = 35_000.0
     interchange_radius_m: float = 450.0
@@ -47,6 +51,26 @@ class MetroConfig:
     parallel_line_buffer_m: float = 450.0
     relocation_search_radius_m: float = 3_000.0
     relocation_step_m: float = 100.0
+    station_risk_buffer_m: float = 180.0
+    candidate_catchment_radius_m: float = 1_200.0
+    central_anchor_radius_m: float = 3_000.0
+    min_central_anchor_candidates: int = 8
+    max_central_anchor_share: float = 0.32
+    min_regional_anchor_candidates: int = 8
+    regional_anchor_weight_floor_fraction: float = 0.08
+    route_anchor_count: int = 8
+    max_turn_angle_deg: float = 55.0
+    hard_max_turn_angle_deg: float = 120.0
+    turn_penalty_per_degree: float = 550.0
+    minimum_curve_radius_m: float = 300.0
+    curve_radius_penalty_per_m: float = 35.0
+    adaptive_station_placement: bool = True
+    station_min_spacing_m: float = 800.0
+    station_max_spacing_m: float = 1_700.0
+    station_candidate_step_m: float = 125.0
+    station_flood_score_factor: float = 0.35
+    station_anchor_bonus_radius_m: float = 260.0
+    station_anchor_bonus: float = 7_500.0
 
     @property
     def station_spacing_m(self) -> float:
@@ -233,6 +257,21 @@ def load_wroclaw_osiedla(
     return read_zipped_shapefile(path).to_crs(target_crs)
 
 
+def city_boundary_from_layer(layer: gpd.GeoDataFrame, name: str = "Wroclaw") -> gpd.GeoDataFrame:
+    """Build a single city-area polygon from districts or other city polygons."""
+
+    if layer is None or layer.empty:
+        return gpd.GeoDataFrame({"name": []}, geometry=[], crs=getattr(layer, "crs", LOCAL_CRS))
+    geoms = []
+    for geom in layer.geometry:
+        if geom is None or geom.is_empty:
+            continue
+        geoms.append(geom if geom.is_valid else geom.buffer(0))
+    if not geoms:
+        return gpd.GeoDataFrame({"name": []}, geometry=[], crs=layer.crs)
+    return gpd.GeoDataFrame({"name": [name]}, geometry=[unary_union(geoms)], crs=layer.crs)
+
+
 def load_wroclaw_surface_water(
     data_dir: str | Path = "data/raw",
     target_crs: int = LOCAL_CRS,
@@ -309,14 +348,46 @@ def load_geology_cost_layer_from_raw(
     """Load a real geology/cost multiplier layer if the user supplies one."""
 
     data_dir = Path(data_dir)
-    for name in ["geology.geojson", "geology.gpkg", "geology.shp", "cost_zones.geojson", "cost_zones.gpkg"]:
+    candidates = [
+        "geology.geojson",
+        "geology.gpkg",
+        "geology.shp",
+        "geology.zip",
+        "cost_zones.geojson",
+        "cost_zones.gpkg",
+        "cost_zones.shp",
+        "cost_zones.zip",
+    ]
+    cost_columns = ["cost_factor", "cost", "factor", "multiplier", "mult", "cost_multip"]
+
+    def _normalise(geology: gpd.GeoDataFrame, source_layer: str) -> gpd.GeoDataFrame:
+        geology = geology.to_crs(target_crs)
+        found = next((col for col in cost_columns if col in geology.columns), None)
+        if found and found != "cost_factor":
+            geology["cost_factor"] = pd.to_numeric(geology[found], errors="coerce").fillna(1.0)
+        elif "cost_factor" not in geology.columns:
+            geology["cost_factor"] = 1.0
+        else:
+            geology["cost_factor"] = pd.to_numeric(geology["cost_factor"], errors="coerce").fillna(1.0)
+        geology["source_layer"] = source_layer
+        return geology
+
+    for name in candidates:
         path = data_dir / name
         if path.exists():
-            geology = gpd.read_file(path).to_crs(target_crs)
-            if "cost_factor" not in geology.columns:
-                geology["cost_factor"] = 1.0
-            geology["source_layer"] = name
-            return geology
+            try:
+                return _normalise(gpd.read_file(path), name)
+            except Exception:
+                try:
+                    return _normalise(gpd.read_file(f"zip://{path}"), name)
+                except Exception:
+                    continue
+
+    folder = data_dir / "geology"
+    if folder.exists() and folder.is_dir():
+        shapefiles = sorted(folder.glob("*.shp"))
+        if shapefiles:
+            return _normalise(gpd.read_file(shapefiles[0]), f"geology/{shapefiles[0].name}")
     return None
 
 
@@ -483,6 +554,32 @@ def nearest_free_point(
     return point, float("nan")
 
 
+def nearest_free_point_from_boundary(
+    point: Point,
+    forbidden_geom,
+    step_m: float = 40.0,
+    max_extra_m: float = 600.0,
+) -> tuple[Point, float]:
+    """Move a point outside a forbidden geometry using the nearest boundary."""
+
+    if forbidden_geom is None or forbidden_geom.is_empty or not forbidden_geom.covers(point):
+        return point, 0.0
+
+    boundary_point = nearest_points(point, forbidden_geom.boundary)[1]
+    vector = np.array([boundary_point.x - point.x, boundary_point.y - point.y], dtype=float)
+    norm = float(np.linalg.norm(vector))
+    if norm == 0.0:
+        return nearest_free_point(point, forbidden_geom, max_radius_m=max_extra_m, step_m=step_m, angle_count=24)
+
+    unit = vector / norm
+    for extra in np.arange(step_m, max_extra_m + step_m, step_m):
+        candidate = Point(boundary_point.x + unit[0] * extra, boundary_point.y + unit[1] * extra)
+        if not forbidden_geom.covers(candidate):
+            return candidate, point.distance(candidate)
+
+    return nearest_free_point(point, forbidden_geom, max_radius_m=max_extra_m, step_m=step_m, angle_count=24)
+
+
 def relocate_demand_from_forbidden(
     demand: gpd.GeoDataFrame,
     forbidden: gpd.GeoDataFrame | None,
@@ -620,21 +717,77 @@ def regional_centres_from_clusters(
     return gpd.GeoDataFrame(rows, geometry="geometry", crs=clusters.crs)
 
 
+def candidate_catchment_weights(
+    candidate_points: list[Point],
+    demand: gpd.GeoDataFrame,
+    radius_m: float,
+    weight_col: str = "population",
+) -> np.ndarray:
+    """Estimate station-anchor value from nearby demand, not only its own polygon."""
+
+    if not candidate_points or demand.empty or radius_m <= 0:
+        return np.zeros(len(candidate_points), dtype=float)
+
+    candidate_xy = np.array([(point.x, point.y) for point in candidate_points], dtype=float)
+    demand_xy = np.column_stack([demand.geometry.x.to_numpy(), demand.geometry.y.to_numpy()])
+    demand_weights = pd.to_numeric(demand[weight_col], errors="coerce").fillna(0.0).to_numpy()
+    distances = np.sqrt(((candidate_xy[:, None, :] - demand_xy[None, :, :]) ** 2).sum(axis=2))
+    coverage = np.clip(1.0 - distances / radius_m, 0.0, 1.0)
+    return coverage @ demand_weights
+
+
 def candidate_station_sites(
     demand: gpd.GeoDataFrame,
     regional_centres: gpd.GeoDataFrame | None = None,
     centres: gpd.GeoDataFrame | None = None,
+    forbidden: gpd.GeoDataFrame | None = None,
+    config: MetroConfig = MetroConfig(),
     max_candidates: int = 80,
     weight_col: str = "population",
     min_separation_m: float = 250.0,
+    catchment_radius_m: float | None = None,
+    risk_buffer_m: float | None = None,
+    central_anchor_radius_m: float | None = None,
+    min_central_anchor_candidates: int | None = None,
+    max_central_anchor_share: float | None = None,
+    min_regional_anchor_candidates: int | None = None,
 ) -> gpd.GeoDataFrame:
     """Create a compact set of candidate station anchors.
 
     This is the search space for the NP-hard part of the model. Candidates can be
     demand points, regional demand centres, and forced city centres/hubs.
+    Flood-risk areas are used to move anchor candidates away from risky polygons
+    and a small buffer around them, while preserving their demand weight.
     """
 
     demand = demand.copy()
+    forbidden = _align_crs(forbidden, demand.crs)
+    forbidden_geom = forbidden_union(forbidden)
+    risk_buffer_m = config.station_risk_buffer_m if risk_buffer_m is None else risk_buffer_m
+    catchment_radius_m = (
+        config.candidate_catchment_radius_m if catchment_radius_m is None else catchment_radius_m
+    )
+    central_anchor_radius_m = (
+        config.central_anchor_radius_m if central_anchor_radius_m is None else central_anchor_radius_m
+    )
+    min_central_anchor_candidates = (
+        config.min_central_anchor_candidates
+        if min_central_anchor_candidates is None
+        else min_central_anchor_candidates
+    )
+    max_central_anchor_share = (
+        config.max_central_anchor_share if max_central_anchor_share is None else max_central_anchor_share
+    )
+    max_central_anchor_candidates = max(
+        min_central_anchor_candidates,
+        int(round(max_candidates * max_central_anchor_share)),
+    )
+    min_regional_anchor_candidates = (
+        config.min_regional_anchor_candidates
+        if min_regional_anchor_candidates is None
+        else min_regional_anchor_candidates
+    )
+
     rows = []
     for idx, row in demand.iterrows():
         rows.append(
@@ -642,7 +795,7 @@ def candidate_station_sites(
                 "source": "demand",
                 "source_id": str(idx),
                 "name": row.get("name", f"demand_{idx}"),
-                "candidate_weight": float(row.get(weight_col, 0.0)),
+                "base_candidate_weight": float(row.get(weight_col, 0.0)),
                 "required": False,
                 "geometry": row.geometry,
             }
@@ -656,7 +809,7 @@ def candidate_station_sites(
                     "source": "regional_centre",
                     "source_id": str(row.get("centre_id", idx)),
                     "name": row.get("name", f"regional_{idx}"),
-                    "candidate_weight": float(row.get("demand_weight", 0.0)),
+                    "base_candidate_weight": float(row.get("demand_weight", 0.0)),
                     "required": False,
                     "geometry": row.geometry,
                 }
@@ -670,26 +823,132 @@ def candidate_station_sites(
                     "source": "forced_centre",
                     "source_id": str(idx),
                     "name": row.get("name", f"centre_{idx}"),
-                    "candidate_weight": float(row.get("candidate_weight", 0.0)),
+                    "base_candidate_weight": float(row.get("candidate_weight", 0.0)),
                     "required": bool(row.get("role", "") == "required_city_centre"),
                     "geometry": row.geometry,
                 }
             )
 
     candidates = gpd.GeoDataFrame(rows, geometry="geometry", crs=demand.crs)
+    if candidates.empty:
+        return candidates
+    candidates["_candidate_uid"] = np.arange(len(candidates))
+
+    original_geometries = list(candidates.geometry)
+    safe_geometries: list[Point] = []
+    relocated: list[float] = []
+    in_flood_zone: list[bool] = []
+    in_flood_buffer: list[bool] = []
+    distance_to_flood: list[float] = []
+
+    if forbidden_geom is not None and not forbidden_geom.is_empty:
+        avoidance_geom = forbidden_geom.buffer(float(risk_buffer_m))
+        for point in original_geometries:
+            inside_zone = bool(forbidden_geom.covers(point))
+            inside_buffer = bool(avoidance_geom.covers(point))
+            distance_to_flood.append(0.0 if inside_zone else float(point.distance(forbidden_geom)))
+            new_point, offset = nearest_free_point_from_boundary(
+                point,
+                avoidance_geom,
+                step_m=config.relocation_step_m,
+                max_extra_m=config.relocation_search_radius_m,
+            )
+            safe_geometries.append(new_point)
+            relocated.append(offset)
+            in_flood_zone.append(inside_zone)
+            in_flood_buffer.append(inside_buffer)
+    else:
+        safe_geometries = original_geometries
+        relocated = [0.0] * len(candidates)
+        in_flood_zone = [False] * len(candidates)
+        in_flood_buffer = [False] * len(candidates)
+        distance_to_flood = [float("inf")] * len(candidates)
+
+    candidates["original_geometry"] = original_geometries
+    candidates = candidates.set_geometry(gpd.GeoSeries(safe_geometries, index=candidates.index, crs=demand.crs))
+    candidates["anchor_relocated_m"] = relocated
+    candidates["in_flood_zone"] = in_flood_zone
+    candidates["in_flood_buffer"] = in_flood_buffer
+    candidates["distance_to_flood_m"] = distance_to_flood
+
+    catchment = candidate_catchment_weights(list(candidates.geometry), demand, catchment_radius_m, weight_col=weight_col)
+    candidates["catchment_weight"] = catchment
+    candidates["base_candidate_weight"] = pd.to_numeric(candidates["base_candidate_weight"], errors="coerce").fillna(0.0)
+    candidates["risk_safety_factor"] = 1.0
+    candidates.loc[candidates["anchor_relocated_m"].fillna(0.0) > 0.0, "risk_safety_factor"] = 0.88
+    still_risky = candidates.geometry.apply(lambda geom: bool(forbidden_geom.covers(geom)) if forbidden_geom is not None and not forbidden_geom.is_empty else False)
+    candidates.loc[still_risky, "risk_safety_factor"] = 0.20
+
+    regional_floor = candidates["base_candidate_weight"] * config.regional_anchor_weight_floor_fraction
+    source_weight = candidates["base_candidate_weight"].where(candidates["source"].ne("regional_centre"), regional_floor)
+    candidates["candidate_weight_raw"] = np.maximum(candidates["catchment_weight"], source_weight)
+    candidates["candidate_weight"] = candidates["candidate_weight_raw"] * candidates["risk_safety_factor"]
+
+    required = candidates[candidates["required"]]
+    if not required.empty:
+        required_centre = required.geometry.iloc[0]
+        candidates["distance_to_required_centre_m"] = candidates.geometry.distance(required_centre)
+        candidates["near_required_centre"] = candidates["distance_to_required_centre_m"] <= central_anchor_radius_m
+    else:
+        candidates["distance_to_required_centre_m"] = np.nan
+        candidates["near_required_centre"] = False
+
     candidates = candidates.sort_values(["required", "candidate_weight"], ascending=[False, False])
 
-    kept_rows = []
+    kept_rows: list[pd.Series] = []
     kept_points: list[Point] = []
-    for _, row in candidates.iterrows():
+
+    def keep_if_possible(row: pd.Series, force: bool = False) -> bool:
         point = row.geometry
         if any(point.distance(existing) < min_separation_m for existing in kept_points):
-            if not row["required"]:
-                continue
+            if not force and not row["required"]:
+                return False
         kept_rows.append(row)
         kept_points.append(point)
+        return True
+
+    for _, row in candidates[candidates["required"]].iterrows():
+        keep_if_possible(row, force=True)
+
+    regional_kept = 0
+    if min_regional_anchor_candidates > 0:
+        regional_pool = candidates[
+            candidates["source"].eq("regional_centre")
+            & ~candidates["required"]
+        ].sort_values("candidate_weight", ascending=False)
+        for _, row in regional_pool.iterrows():
+            if keep_if_possible(row):
+                regional_kept += 1
+            if regional_kept >= min_regional_anchor_candidates:
+                break
+
+    central_kept = 0
+    if min_central_anchor_candidates > 0 and candidates["near_required_centre"].any():
+        central_pool = candidates[
+            candidates["near_required_centre"]
+            & candidates["source"].eq("demand")
+            & ~candidates["required"]
+        ].sort_values("candidate_weight", ascending=False)
+        for _, row in central_pool.iterrows():
+            if keep_if_possible(row):
+                central_kept += 1
+            if central_kept >= min_central_anchor_candidates:
+                break
+
+    for _, row in candidates[~candidates["required"]].iterrows():
+        if len(kept_rows) >= max_candidates + len(candidates[candidates["required"]]):
+            break
+        if row["_candidate_uid"] in {item["_candidate_uid"] for item in kept_rows}:
+            continue
+        is_central_demand = bool(row.get("near_required_centre", False)) and row.get("source") == "demand"
+        if is_central_demand and central_kept >= max_central_anchor_candidates:
+            continue
+        if not keep_if_possible(row):
+            continue
+        if is_central_demand:
+            central_kept += 1
         optional_count = sum(not item["required"] for item in kept_rows)
-        if optional_count >= max_candidates and not bool(row["required"]):
+        if optional_count >= max_candidates:
             break
 
     out = gpd.GeoDataFrame(kept_rows, geometry="geometry", crs=demand.crs).reset_index(drop=True)
@@ -701,6 +960,62 @@ def route_length_m(points: list[Point]) -> float:
     if len(points) < 2:
         return 0.0
     return float(sum(points[idx].distance(points[idx + 1]) for idx in range(len(points) - 1)))
+
+
+def _empty_turn_metrics() -> dict:
+    return {
+        "turn_penalty": 0.0,
+        "max_turn_angle_deg": 0.0,
+        "mean_turn_angle_deg": 0.0,
+        "sharp_turn_count": 0,
+        "curve_radius_violation_m": 0.0,
+    }
+
+
+def _turn_metrics_from_xy(xy: np.ndarray, config: MetroConfig) -> dict:
+    """Approximate alignment feasibility from polyline deflection angles."""
+
+    if len(xy) < 3:
+        return _empty_turn_metrics()
+
+    incoming = xy[1:-1] - xy[:-2]
+    outgoing = xy[2:] - xy[1:-1]
+    incoming_lengths = np.linalg.norm(incoming, axis=1)
+    outgoing_lengths = np.linalg.norm(outgoing, axis=1)
+    valid = (incoming_lengths > 0.0) & (outgoing_lengths > 0.0)
+    if not np.any(valid):
+        return _empty_turn_metrics()
+
+    incoming = incoming[valid]
+    outgoing = outgoing[valid]
+    incoming_lengths = incoming_lengths[valid]
+    outgoing_lengths = outgoing_lengths[valid]
+    cosines = np.sum(incoming * outgoing, axis=1) / (incoming_lengths * outgoing_lengths)
+    angles = np.degrees(np.arccos(np.clip(cosines, -1.0, 1.0)))
+    excess_angles = np.maximum(0.0, angles - config.max_turn_angle_deg)
+    angle_penalty = float(excess_angles.sum() * config.turn_penalty_per_degree)
+
+    radius_violation = 0.0
+    if config.minimum_curve_radius_m > 0.0:
+        required_tangent = config.minimum_curve_radius_m * np.tan(np.radians(angles) / 2.0)
+        available_tangent = 0.5 * np.minimum(incoming_lengths, outgoing_lengths)
+        radius_violation = float(np.maximum(0.0, required_tangent - available_tangent).sum())
+
+    radius_penalty = radius_violation * config.curve_radius_penalty_per_m
+    return {
+        "turn_penalty": angle_penalty + radius_penalty,
+        "max_turn_angle_deg": float(angles.max()),
+        "mean_turn_angle_deg": float(angles.mean()),
+        "sharp_turn_count": int((angles > config.max_turn_angle_deg).sum()),
+        "curve_radius_violation_m": radius_violation,
+    }
+
+
+def route_turn_metrics(points: list[Point], config: MetroConfig) -> dict:
+    if len(points) < 3:
+        return _empty_turn_metrics()
+    xy = np.array([(point.x, point.y) for point in points], dtype=float)
+    return _turn_metrics_from_xy(xy, config)
 
 
 def route_polyline(points: list[Point]) -> LineString:
@@ -752,10 +1067,29 @@ def route_forbidden_km(points: list[Point], forbidden: gpd.GeoDataFrame | None) 
     return float(route_polyline(points).intersection(union).length / 1_000.0)
 
 
+def line_outside_city_km(line: LineString, city_boundary: gpd.GeoDataFrame | None) -> float:
+    city_area = forbidden_union(city_boundary)
+    if city_area is None or city_area.is_empty or line.is_empty:
+        return 0.0
+    return float(line.difference(city_area).length / 1_000.0)
+
+
+def route_outside_city_km(points: list[Point], city_boundary: gpd.GeoDataFrame | None) -> float:
+    if len(points) < 2:
+        return 0.0
+    return line_outside_city_km(route_polyline(points), city_boundary)
+
+
 def route_geology_factor(points: list[Point], geology: gpd.GeoDataFrame | None) -> float:
     if len(points) < 2:
         return 1.0
     return geology_multiplier_for_line(route_polyline(points), geology)
+
+
+def route_geology_excess_km(points: list[Point], geology: gpd.GeoDataFrame | None) -> float:
+    if len(points) < 2:
+        return 0.0
+    return geology_excess_km_for_line(route_polyline(points), geology)
 
 
 def water_crossing_km(points: list[Point], water_crossings: gpd.GeoDataFrame | None) -> float:
@@ -820,6 +1154,7 @@ def route_score_from_points(
     transfer_points: gpd.GeoDataFrame | None = None,
     transfer_lines: gpd.GeoDataFrame | None = None,
     existing_lines: gpd.GeoDataFrame | None = None,
+    city_boundary: gpd.GeoDataFrame | None = None,
 ) -> dict:
     """Score an ordered station/anchor sequence.
 
@@ -835,10 +1170,14 @@ def route_score_from_points(
             "route_length_m": 0.0,
             "forbidden_km": 0.0,
             "geology_factor": 1.0,
+            "geology_excess_km": 0.0,
             "water_crossing_km": 0.0,
             "transfer_score": 0.0,
             "transfer_count": 0,
             "line_overlap_km": 0.0,
+            "outside_city_km": 0.0,
+            "outside_city_penalty": 0.0,
+            **_empty_turn_metrics(),
         }
 
     demand_xy = np.column_stack([demand.geometry.x.to_numpy(), demand.geometry.y.to_numpy()])
@@ -849,14 +1188,21 @@ def route_score_from_points(
     total_weight = float(weights.sum())
     served_weight = float(np.sum(weights * coverage_score))
     forbidden_km = route_forbidden_km(points, forbidden)
-    geology_factor = route_geology_factor(points, geology)
+    route_km = route_length_m(points) / 1_000.0
+    geology_excess_km = route_geology_excess_km(points, geology)
+    geology_factor = 1.0 + geology_excess_km / route_km if route_km else 1.0
     water_km = water_crossing_km(points, water_crossings)
     transfer_score, transfer_count = transfer_interchange_score(points, transfer_points, transfer_lines, config)
     overlap_km = line_overlap_km(points, existing_lines if existing_lines is not None else transfer_lines, config)
+    outside_city_km = route_outside_city_km(points, city_boundary)
+    outside_city_penalty = outside_city_km * config.outside_city_penalty_per_km
+    turn_metrics = route_turn_metrics(points, config)
     score = served_weight
     score -= forbidden_km * config.forbidden_penalty_per_km
-    score -= max(0.0, geology_factor - 1.0) * config.geology_penalty
+    score -= outside_city_penalty
+    score -= geology_excess_km * config.geology_penalty_per_km
     score -= overlap_km * config.line_overlap_penalty_per_km
+    score -= turn_metrics["turn_penalty"]
     score += water_km * config.river_crossing_bonus_per_km
     score += transfer_score
     return {
@@ -866,11 +1212,171 @@ def route_score_from_points(
         "route_length_m": route_length_m(points),
         "forbidden_km": forbidden_km,
         "geology_factor": geology_factor,
+        "geology_excess_km": geology_excess_km,
         "water_crossing_km": water_km,
         "transfer_score": transfer_score,
         "transfer_count": transfer_count,
         "line_overlap_km": overlap_km,
+        "outside_city_km": outside_city_km,
+        "outside_city_penalty": outside_city_penalty,
+        **turn_metrics,
     }
+
+
+def construction_cost_mln(
+    length_km: float,
+    forbidden_km: float,
+    geology_factor: float,
+    config: MetroConfig,
+) -> tuple[float, float, float]:
+    """Estimate line construction cost with flood-risk segments priced higher."""
+
+    base_cost = length_km * config.cost_per_km_mln * geology_factor
+    flood_extra = max(0.0, forbidden_km) * config.cost_per_km_mln * max(0.0, config.flood_cost_multiplier - 1.0)
+    return base_cost + flood_extra, base_cost, flood_extra
+
+
+def station_candidate_scores_along_line(
+    line: LineString,
+    distances: np.ndarray,
+    demand: gpd.GeoDataFrame,
+    forbidden_geom,
+    config: MetroConfig,
+    weight_col: str = "population",
+    route_anchor_points: list[Point] | None = None,
+) -> np.ndarray:
+    """Score possible station locations along a corridor by nearby demand and risk."""
+
+    points = [line.interpolate(float(distance)) for distance in distances]
+    scores = candidate_catchment_weights(points, demand, config.walk_radius_m, weight_col=weight_col)
+
+    if route_anchor_points and config.station_anchor_bonus > 0.0 and config.station_anchor_bonus_radius_m > 0.0:
+        anchor_distances = np.array([line.project(point) for point in route_anchor_points], dtype=float)
+        if len(anchor_distances):
+            nearest_along_line = np.abs(distances[:, None] - anchor_distances[None, :]).min(axis=1)
+            anchor_bonus = np.clip(1.0 - nearest_along_line / config.station_anchor_bonus_radius_m, 0.0, 1.0)
+            scores = scores + anchor_bonus * config.station_anchor_bonus
+
+    if forbidden_geom is not None and not forbidden_geom.is_empty:
+        risk_zone = forbidden_geom.buffer(config.station_risk_buffer_m)
+        risk_factor = np.array(
+            [
+                config.station_flood_score_factor if risk_zone.covers(point) else 1.0
+                for point in points
+            ],
+            dtype=float,
+        )
+        scores = scores * risk_factor
+    return scores
+
+
+def optimise_station_distances_along_line(
+    line: LineString,
+    demand: gpd.GeoDataFrame,
+    forbidden_geom,
+    config: MetroConfig,
+    weight_col: str = "population",
+    route_anchor_points: list[Point] | None = None,
+) -> tuple[np.ndarray, str]:
+    """Choose station positions along the final corridor with spacing constraints.
+
+    End stations stay at the corridor ends for comparability with Warsaw M1.
+    Interior stations are selected by dynamic programming from a dense 1D grid.
+    """
+
+    if not config.adaptive_station_placement or config.station_count <= 2 or line.length <= 0:
+        return np.linspace(0.0, line.length, config.station_count), "uniform"
+
+    grid = np.arange(0.0, line.length + config.station_candidate_step_m, config.station_candidate_step_m)
+    grid = grid[(grid > 0.0) & (grid < line.length)]
+    distances = np.concatenate(([0.0], grid, [line.length]))
+    distances = np.unique(np.round(distances, 6))
+    last_index = len(distances) - 1
+    station_count = config.station_count
+
+    scores = station_candidate_scores_along_line(
+        line,
+        distances,
+        demand,
+        forbidden_geom,
+        config,
+        weight_col=weight_col,
+        route_anchor_points=route_anchor_points,
+    )
+    dp = np.full((station_count, len(distances)), -np.inf)
+    prev = np.full((station_count, len(distances)), -1, dtype=int)
+    dp[0, 0] = scores[0]
+
+    for station_idx in range(1, station_count):
+        for current in range(1, len(distances)):
+            spacing = distances[current] - distances[:current]
+            feasible = np.where(
+                (spacing >= config.station_min_spacing_m)
+                & (spacing <= config.station_max_spacing_m)
+                & np.isfinite(dp[station_idx - 1, :current])
+            )[0]
+            if len(feasible) == 0:
+                continue
+            best_prev = feasible[np.argmax(dp[station_idx - 1, feasible])]
+            dp[station_idx, current] = dp[station_idx - 1, best_prev] + scores[current]
+            prev[station_idx, current] = best_prev
+
+    if not np.isfinite(dp[station_count - 1, last_index]):
+        return np.linspace(0.0, line.length, station_count), "uniform_fallback"
+
+    chosen = [last_index]
+    current = last_index
+    for station_idx in range(station_count - 1, 0, -1):
+        current = int(prev[station_idx, current])
+        if current < 0:
+            return np.linspace(0.0, line.length, station_count), "uniform_fallback"
+        chosen.append(current)
+    chosen = list(reversed(chosen))
+    return distances[chosen], "adaptive_dp"
+
+
+def stations_for_corridor(
+    corridor: LineString,
+    demand: gpd.GeoDataFrame,
+    forbidden_geom,
+    config: MetroConfig,
+    line_id: int,
+    weight_col: str = "population",
+    route_anchor_points: list[Point] | None = None,
+) -> gpd.GeoDataFrame:
+    distances, placement = optimise_station_distances_along_line(
+        corridor,
+        demand,
+        forbidden_geom,
+        config,
+        weight_col=weight_col,
+        route_anchor_points=route_anchor_points,
+    )
+    previous_spacing = np.concatenate(([np.nan], np.diff(distances)))
+    next_spacing = np.concatenate((np.diff(distances), [np.nan]))
+    station_points = [corridor.interpolate(float(distance)) for distance in distances]
+    if route_anchor_points:
+        nearest_anchor_m = [min(point.distance(anchor) for anchor in route_anchor_points) for point in station_points]
+    else:
+        nearest_anchor_m = [np.nan] * len(station_points)
+    return gpd.GeoDataFrame(
+        {
+            "line_id": line_id,
+            "station_id": np.arange(1, config.station_count + 1),
+            "station_code": [f"L{line_id:02d}-S{sid:02d}" for sid in range(1, config.station_count + 1)],
+            "distance_m": distances,
+            "spacing_from_previous_m": previous_spacing,
+            "spacing_to_next_m": next_spacing,
+            "station_placement": placement,
+            "nearest_route_anchor_m": nearest_anchor_m,
+            "near_route_anchor": [
+                bool(distance <= config.station_anchor_bonus_radius_m) if np.isfinite(distance) else False
+                for distance in nearest_anchor_m
+            ],
+        },
+        geometry=station_points,
+        crs=demand.crs,
+    )
 
 
 def _two_opt_route(
@@ -940,6 +1446,7 @@ def solve_orienteering_route(
     force_station_count: bool = True,
     min_anchor_spacing_m: float = 550.0,
     line_id: int = 1,
+    city_boundary: gpd.GeoDataFrame | None = None,
 ) -> dict:
     """Solve a prize-collecting TSP / orienteering approximation.
 
@@ -954,54 +1461,65 @@ def solve_orienteering_route(
     water_crossings = _align_crs(water_crossings, demand.crs)
     transfer_points = _align_crs(transfer_points, demand.crs)
     transfer_lines = _align_crs(transfer_lines, demand.crs)
+    city_boundary = _align_crs(city_boundary, demand.crs)
     forbidden_geom = forbidden_union(forbidden)
     water_geom = forbidden_union(water_crossings)
+    city_boundary_geom = forbidden_union(city_boundary)
 
     if "candidate_id" not in candidates.columns:
         candidates["candidate_id"] = [f"C{i:03d}" for i in range(1, len(candidates) + 1)]
     if "name" not in candidates.columns:
         candidates["name"] = candidates["candidate_id"]
 
-    nodes: list[dict] = [
-        {
+    if "required" in candidates.columns:
+        required_candidates = candidates[candidates["required"].astype(bool)]
+    else:
+        required_candidates = candidates.iloc[0:0]
+    if not required_candidates.empty:
+        centre_row = required_candidates.iloc[0]
+        centre = centre_row.geometry
+        centre_node = _node_from_candidate_row(centre_row, geometry=centre, candidate_id="FORCED-CENTRE")
+        centre_node["source"] = "required"
+        candidate_iter = candidates[~candidates.index.isin(required_candidates.index)]
+    else:
+        centre_node = {
             "candidate_id": "FORCED-CENTRE",
             "name": "forced centre",
             "source": "required",
             "geometry": centre,
         }
-    ]
-    for _, row in candidates.iterrows():
-        nodes.append(
-            {
-                "candidate_id": str(row["candidate_id"]),
-                "name": row.get("name", str(row["candidate_id"])),
-                "source": row.get("source", "candidate"),
-                "geometry": row.geometry,
-            }
-        )
+        candidate_iter = candidates
+
+    nodes: list[dict] = [centre_node]
+    for _, row in candidate_iter.iterrows():
+        nodes.append(_node_from_candidate_row(row))
 
     matrices = _fast_orienteering_matrices(
         demand,
         nodes,
         forbidden_geom,
+        geology,
         config,
         weight_col,
         water_geom=water_geom,
         transfer_points=transfer_points,
         transfer_lines=transfer_lines,
         existing_lines=transfer_lines,
+        city_boundary_geom=city_boundary_geom,
     )
     distance_matrix = matrices["distance_matrix"]
 
     def fast_metrics(order: list[int]) -> dict:
         return _fast_order_metrics(order, matrices, config)
 
+    target_anchor_count = max(1, min(int(config.route_anchor_count), len(nodes), config.station_count))
+
     selected_order = [0]
     selected_nodes = {0}
     log_rows = []
     current_metrics = fast_metrics(selected_order)
 
-    while len(selected_order) < config.station_count:
+    while len(selected_order) < target_anchor_count:
         best_move = None
         for node_index in range(1, len(nodes)):
             if node_index in selected_nodes:
@@ -1015,6 +1533,11 @@ def solve_orienteering_route(
                 if proposal_length > config.length_m:
                     continue
                 metrics = fast_metrics(proposal_order)
+                if (
+                    config.hard_max_turn_angle_deg > 0.0
+                    and metrics["max_turn_angle_deg"] > config.hard_max_turn_angle_deg
+                ):
+                    continue
                 improvement = metrics["score"] - current_metrics["score"]
                 added_length = max(1.0, proposal_length - current_metrics["route_length_m"])
                 ratio = improvement / added_length
@@ -1064,7 +1587,14 @@ def solve_orienteering_route(
                     + selected_order[right + 1 :]
                 )
                 metrics = fast_metrics(proposal_order)
-                if metrics["route_length_m"] <= config.length_m and metrics["score"] > best_score:
+                if (
+                    metrics["route_length_m"] <= config.length_m
+                    and metrics["score"] > best_score
+                    and (
+                        config.hard_max_turn_angle_deg <= 0.0
+                        or metrics["max_turn_angle_deg"] <= config.hard_max_turn_angle_deg
+                    )
+                ):
                     selected_order = proposal_order
                     improved = True
                     break
@@ -1077,17 +1607,18 @@ def solve_orienteering_route(
     anchor_points = [item["geometry"] for item in selected]
     corridor_points = extend_route_points_to_length(anchor_points, config.length_m)
     corridor = route_polyline(corridor_points)
+    corridor_turn_metrics = route_turn_metrics(corridor_points, config)
+    outside_city_km = line_outside_city_km(corridor, city_boundary)
+    outside_city_penalty = outside_city_km * config.outside_city_penalty_per_km
 
-    station_distances = np.linspace(0.0, corridor.length, config.station_count)
-    stations = gpd.GeoDataFrame(
-        {
-            "line_id": line_id,
-            "station_id": np.arange(1, config.station_count + 1),
-            "station_code": [f"L{line_id:02d}-S{sid:02d}" for sid in range(1, config.station_count + 1)],
-            "distance_m": station_distances,
-        },
-        geometry=[corridor.interpolate(distance) for distance in station_distances],
-        crs=demand.crs,
+    stations = stations_for_corridor(
+        corridor,
+        demand,
+        forbidden_geom,
+        config,
+        line_id,
+        weight_col=weight_col,
+        route_anchor_points=anchor_points,
     )
 
     final_points = list(stations.geometry)
@@ -1103,15 +1634,40 @@ def solve_orienteering_route(
         transfer_lines=transfer_lines,
         existing_lines=transfer_lines,
     )
+    final_metrics["score"] -= outside_city_penalty
+    final_metrics["outside_city_km"] = outside_city_km
+    final_metrics["outside_city_penalty"] = outside_city_penalty
+    estimated_cost, base_cost, flood_extra_cost = construction_cost_mln(
+        corridor.length / 1_000.0,
+        final_metrics["forbidden_km"],
+        final_metrics["geology_factor"],
+        config,
+    )
+
+    anchor_data = {
+        "line_id": line_id,
+        "anchor_order": np.arange(1, len(selected) + 1),
+        "candidate_id": [item["candidate_id"] for item in selected],
+        "name": [item["name"] for item in selected],
+        "source": [item["source"] for item in selected],
+    }
+    optional_anchor_fields = [
+        "candidate_weight",
+        "base_candidate_weight",
+        "catchment_weight",
+        "risk_safety_factor",
+        "anchor_relocated_m",
+        "in_flood_zone",
+        "in_flood_buffer",
+        "distance_to_flood_m",
+        "near_required_centre",
+        "distance_to_required_centre_m",
+    ]
+    for field in optional_anchor_fields:
+        anchor_data[field] = [item.get(field, np.nan) for item in selected]
 
     anchors = gpd.GeoDataFrame(
-        {
-            "line_id": line_id,
-            "anchor_order": np.arange(1, len(selected) + 1),
-            "candidate_id": [item["candidate_id"] for item in selected],
-            "name": [item["name"] for item in selected],
-            "source": [item["source"] for item in selected],
-        },
+        anchor_data,
         geometry=[item["geometry"] for item in selected],
         crs=demand.crs,
     )
@@ -1125,10 +1681,22 @@ def solve_orienteering_route(
             "served_share": [final_metrics["served_share"]],
             "forbidden_km": [final_metrics["forbidden_km"]],
             "geology_factor": [final_metrics["geology_factor"]],
+            "geology_excess_km": [final_metrics["geology_excess_km"]],
             "water_crossing_km": [final_metrics["water_crossing_km"]],
+            "outside_city_km": [outside_city_km],
+            "outside_city_penalty": [outside_city_penalty],
             "transfer_score": [final_metrics["transfer_score"]],
             "transfer_count": [final_metrics["transfer_count"]],
             "line_overlap_km": [final_metrics["line_overlap_km"]],
+            "turn_penalty": [corridor_turn_metrics["turn_penalty"]],
+            "max_turn_angle_deg": [corridor_turn_metrics["max_turn_angle_deg"]],
+            "mean_turn_angle_deg": [corridor_turn_metrics["mean_turn_angle_deg"]],
+            "sharp_turn_count": [corridor_turn_metrics["sharp_turn_count"]],
+            "curve_radius_violation_m": [corridor_turn_metrics["curve_radius_violation_m"]],
+            "estimated_cost_mln": [estimated_cost],
+            "base_cost_mln": [base_cost],
+            "flood_extra_cost_mln": [flood_extra_cost],
+            "flood_cost_multiplier": [config.flood_cost_multiplier],
             "score": [final_metrics["score"]],
             "anchor_objective_score": [anchor_metrics["score"]],
             "anchor_served_weight": [anchor_metrics["served_weight"]],
@@ -1153,27 +1721,60 @@ def solve_orienteering_route(
     }
 
 
+def _node_from_candidate_row(
+    row: pd.Series,
+    geometry: Point | None = None,
+    candidate_id: str | None = None,
+) -> dict:
+    node = {
+        "candidate_id": candidate_id or str(row.get("candidate_id", "")),
+        "name": row.get("name", str(row.get("candidate_id", "candidate"))),
+        "source": row.get("source", "candidate"),
+        "geometry": geometry or row.geometry,
+    }
+    for field in [
+        "candidate_weight",
+        "base_candidate_weight",
+        "catchment_weight",
+        "risk_safety_factor",
+        "anchor_relocated_m",
+        "in_flood_zone",
+        "in_flood_buffer",
+        "distance_to_flood_m",
+        "near_required_centre",
+        "distance_to_required_centre_m",
+    ]:
+        if field in row:
+            node[field] = row.get(field)
+    return node
+
+
 def _nodes_from_candidates(
     candidates: gpd.GeoDataFrame,
     centre: Point,
 ) -> list[dict]:
-    nodes: list[dict] = [
-        {
+    if "required" in candidates.columns:
+        required_candidates = candidates[candidates["required"].astype(bool)]
+    else:
+        required_candidates = candidates.iloc[0:0]
+
+    if not required_candidates.empty:
+        centre_row = required_candidates.iloc[0]
+        centre_node = _node_from_candidate_row(centre_row, geometry=centre_row.geometry, candidate_id="FORCED-CENTRE")
+        centre_node["source"] = "required"
+        candidate_iter = candidates[~candidates.index.isin(required_candidates.index)]
+    else:
+        centre_node = {
             "candidate_id": "FORCED-CENTRE",
             "name": "forced centre",
             "source": "required",
             "geometry": centre,
         }
-    ]
-    for _, row in candidates.iterrows():
-        nodes.append(
-            {
-                "candidate_id": str(row["candidate_id"]),
-                "name": row.get("name", str(row["candidate_id"])),
-                "source": row.get("source", "candidate"),
-                "geometry": row.geometry,
-            }
-        )
+        candidate_iter = candidates
+
+    nodes: list[dict] = [centre_node]
+    for _, row in candidate_iter.iterrows():
+        nodes.append(_node_from_candidate_row(row))
     return nodes
 
 
@@ -1181,12 +1782,14 @@ def _fast_orienteering_matrices(
     demand: gpd.GeoDataFrame,
     nodes: list[dict],
     forbidden_geom,
+    geology: gpd.GeoDataFrame | None,
     config: MetroConfig,
     weight_col: str,
     water_geom=None,
     transfer_points: gpd.GeoDataFrame | None = None,
     transfer_lines: gpd.GeoDataFrame | None = None,
     existing_lines: gpd.GeoDataFrame | None = None,
+    city_boundary_geom=None,
 ) -> dict:
     node_xy = np.array([(item["geometry"].x, item["geometry"].y) for item in nodes], dtype=float)
     deltas = node_xy[:, None, :] - node_xy[None, :, :]
@@ -1201,6 +1804,15 @@ def _fast_orienteering_matrices(
                 forbidden_matrix[left, right] = value
                 forbidden_matrix[right, left] = value
 
+    geology_excess_matrix = np.zeros_like(distance_matrix)
+    if geology is not None and not geology.empty:
+        for left in range(len(nodes)):
+            for right in range(left + 1, len(nodes)):
+                segment = LineString([tuple(node_xy[left]), tuple(node_xy[right])])
+                value = geology_excess_km_for_line(segment, geology, sample_count=24)
+                geology_excess_matrix[left, right] = value
+                geology_excess_matrix[right, left] = value
+
     water_matrix = np.zeros_like(distance_matrix)
     if water_geom is not None and not water_geom.is_empty:
         for left in range(len(nodes)):
@@ -1209,6 +1821,15 @@ def _fast_orienteering_matrices(
                 value = float(segment.intersection(water_geom).length / 1_000.0)
                 water_matrix[left, right] = value
                 water_matrix[right, left] = value
+
+    outside_city_matrix = np.zeros_like(distance_matrix)
+    if city_boundary_geom is not None and not city_boundary_geom.is_empty:
+        for left in range(len(nodes)):
+            for right in range(left + 1, len(nodes)):
+                segment = LineString([tuple(node_xy[left]), tuple(node_xy[right])])
+                value = float(segment.difference(city_boundary_geom).length / 1_000.0)
+                outside_city_matrix[left, right] = value
+                outside_city_matrix[right, left] = value
 
     transfer_segment_matrix = np.zeros_like(distance_matrix)
     if transfer_lines is not None and not transfer_lines.empty:
@@ -1246,9 +1867,13 @@ def _fast_orienteering_matrices(
     coverage_matrix = np.clip(1.0 - node_to_demand / config.walk_radius_m, 0.0, 1.0)
 
     return {
+        "node_xy": node_xy,
+        "city_boundary_geom": city_boundary_geom,
         "distance_matrix": distance_matrix,
         "forbidden_matrix": forbidden_matrix,
+        "geology_excess_matrix": geology_excess_matrix,
         "water_matrix": water_matrix,
+        "outside_city_matrix": outside_city_matrix,
         "transfer_segment_matrix": transfer_segment_matrix,
         "transfer_point_coverage": transfer_point_coverage,
         "overlap_matrix": overlap_matrix,
@@ -1267,11 +1892,19 @@ def _fast_order_metrics(order: list[int], matrices: Mapping, config: MetroConfig
             "route_length_m": 0.0,
             "forbidden_km": 0.0,
             "geology_factor": 1.0,
+            "geology_excess_km": 0.0,
+            "outside_city_km": 0.0,
+            "outside_city_penalty": 0.0,
+            **_empty_turn_metrics(),
         }
 
+    node_xy = matrices["node_xy"]
+    city_boundary_geom = matrices.get("city_boundary_geom")
     distance_matrix = matrices["distance_matrix"]
     forbidden_matrix = matrices["forbidden_matrix"]
+    geology_excess_matrix = matrices.get("geology_excess_matrix", np.zeros_like(distance_matrix))
     water_matrix = matrices.get("water_matrix", np.zeros_like(distance_matrix))
+    outside_city_matrix = matrices.get("outside_city_matrix", np.zeros_like(distance_matrix))
     transfer_segment_matrix = matrices.get("transfer_segment_matrix", np.zeros_like(distance_matrix))
     transfer_point_coverage = matrices.get("transfer_point_coverage", np.zeros(len(distance_matrix)))
     overlap_matrix = matrices.get("overlap_matrix", np.zeros_like(distance_matrix))
@@ -1284,23 +1917,40 @@ def _fast_order_metrics(order: list[int], matrices: Mapping, config: MetroConfig
         right = np.array(order[1:], dtype=int)
         length_m = float(distance_matrix[left, right].sum())
         forbidden_km = float(forbidden_matrix[left, right].sum())
+        geology_excess_km = float(geology_excess_matrix[left, right].sum())
         water_km = float(water_matrix[left, right].sum())
+        outside_city_km = float(outside_city_matrix[left, right].sum())
         transfer_segment_count = int(min(2, transfer_segment_matrix[left, right].sum()))
         overlap_km = float(overlap_matrix[left, right].sum())
     else:
         length_m = 0.0
         forbidden_km = 0.0
+        geology_excess_km = 0.0
         water_km = 0.0
+        outside_city_km = 0.0
         transfer_segment_count = 0
         overlap_km = 0.0
 
-    coverage = coverage_matrix[np.array(order, dtype=int)].max(axis=0)
+    order_array = np.array(order, dtype=int)
+    if city_boundary_geom is not None and not city_boundary_geom.is_empty:
+        full_corridor_points = [Point(float(x), float(y)) for x, y in node_xy[order_array]]
+        full_corridor_points = extend_route_points_to_length(full_corridor_points, config.length_m)
+        outside_city_km = line_outside_city_km(route_polyline(full_corridor_points), city_boundary_geom)
+
+    coverage = coverage_matrix[order_array].max(axis=0)
     served_weight = float(np.sum(demand_weights * coverage))
-    transfer_point_count = int(min(2, transfer_point_coverage[np.array(order, dtype=int)].sum()))
+    transfer_point_count = int(min(2, transfer_point_coverage[order_array].sum()))
     transfer_count = int(min(3, transfer_point_count + transfer_segment_count))
     transfer_score = float(transfer_count * config.transfer_bonus_per_interchange)
+    route_km = length_m / 1_000.0
+    geology_factor = 1.0 + geology_excess_km / route_km if route_km else 1.0
+    outside_city_penalty = outside_city_km * config.outside_city_penalty_per_km
+    turn_metrics = _turn_metrics_from_xy(node_xy[order_array], config)
     score = served_weight - forbidden_km * config.forbidden_penalty_per_km
+    score -= geology_excess_km * config.geology_penalty_per_km
+    score -= outside_city_penalty
     score -= overlap_km * config.line_overlap_penalty_per_km
+    score -= turn_metrics["turn_penalty"]
     score += water_km * config.river_crossing_bonus_per_km
     score += transfer_score
     return {
@@ -1309,11 +1959,15 @@ def _fast_order_metrics(order: list[int], matrices: Mapping, config: MetroConfig
         "served_share": served_weight / total_weight if total_weight else 0.0,
         "route_length_m": length_m,
         "forbidden_km": forbidden_km,
-        "geology_factor": 1.0,
+        "geology_factor": geology_factor,
+        "geology_excess_km": geology_excess_km,
         "water_crossing_km": water_km,
         "transfer_score": transfer_score,
         "transfer_count": transfer_count,
         "line_overlap_km": overlap_km,
+        "outside_city_km": outside_city_km,
+        "outside_city_penalty": outside_city_penalty,
+        **turn_metrics,
     }
 
 
@@ -1364,6 +2018,7 @@ def solve_exact_orienteering_bruteforce(
     max_selected_candidates: int | None = None,
     min_anchor_spacing_m: float = 550.0,
     line_id: int = 1,
+    city_boundary: gpd.GeoDataFrame | None = None,
 ) -> dict:
     """Brute-force exact search for a deliberately small candidate subset.
 
@@ -1379,7 +2034,9 @@ def solve_exact_orienteering_bruteforce(
     candidates = _align_crs(candidates, demand.crs).copy()
     forbidden = _align_crs(forbidden, demand.crs)
     geology = _align_crs(geology, demand.crs)
+    city_boundary = _align_crs(city_boundary, demand.crs)
     forbidden_geom = forbidden_union(forbidden)
+    city_boundary_geom = forbidden_union(city_boundary)
 
     if "candidate_id" not in candidates.columns:
         candidates["candidate_id"] = [f"C{i:03d}" for i in range(1, len(candidates) + 1)]
@@ -1393,10 +2050,21 @@ def solve_exact_orienteering_bruteforce(
     )
 
     nodes = _nodes_from_candidates(candidates, centre)
-    matrices = _fast_orienteering_matrices(demand, nodes, forbidden_geom, config, weight_col)
+    matrices = _fast_orienteering_matrices(
+        demand,
+        nodes,
+        forbidden_geom,
+        geology,
+        config,
+        weight_col,
+        city_boundary_geom=city_boundary_geom,
+    )
     distance_matrix = matrices["distance_matrix"]
     optional_ids = list(range(1, len(nodes)))
-    max_selected = len(optional_ids) if max_selected_candidates is None else min(max_selected_candidates, len(optional_ids))
+    if max_selected_candidates is None:
+        max_selected = min(len(optional_ids), max(0, int(config.route_anchor_count) - 1))
+    else:
+        max_selected = min(max_selected_candidates, len(optional_ids), max(0, int(config.route_anchor_count) - 1))
 
     best_order = [0]
     best_metrics = _fast_order_metrics(best_order, matrices, config)
@@ -1422,6 +2090,11 @@ def solve_exact_orienteering_bruteforce(
                 metrics = _fast_order_metrics(order, matrices, config)
                 if metrics["route_length_m"] > config.length_m:
                     continue
+                if (
+                    config.hard_max_turn_angle_deg > 0.0
+                    and metrics["max_turn_angle_deg"] > config.hard_max_turn_angle_deg
+                ):
+                    continue
                 if metrics["score"] > best_metrics["score"]:
                     best_order = order
                     best_metrics = metrics
@@ -1431,16 +2104,18 @@ def solve_exact_orienteering_bruteforce(
     corridor_points = extend_route_points_to_length(anchor_points, config.length_m)
     corridor = route_polyline(corridor_points)
 
-    station_distances = np.linspace(0.0, corridor.length, config.station_count)
-    stations = gpd.GeoDataFrame(
-        {
-            "line_id": line_id,
-            "station_id": np.arange(1, config.station_count + 1),
-            "station_code": [f"L{line_id:02d}-S{sid:02d}" for sid in range(1, config.station_count + 1)],
-            "distance_m": station_distances,
-        },
-        geometry=[corridor.interpolate(distance) for distance in station_distances],
-        crs=demand.crs,
+    corridor_turn_metrics = route_turn_metrics(corridor_points, config)
+    outside_city_km = line_outside_city_km(corridor, city_boundary)
+    outside_city_penalty = outside_city_km * config.outside_city_penalty_per_km
+
+    stations = stations_for_corridor(
+        corridor,
+        demand,
+        forbidden_geom,
+        config,
+        line_id,
+        weight_col=weight_col,
+        route_anchor_points=anchor_points,
     )
 
     final_metrics = route_score_from_points(
@@ -1450,6 +2125,15 @@ def solve_exact_orienteering_bruteforce(
         geology,
         config,
         weight_col=weight_col,
+    )
+    final_metrics["score"] -= outside_city_penalty
+    final_metrics["outside_city_km"] = outside_city_km
+    final_metrics["outside_city_penalty"] = outside_city_penalty
+    estimated_cost, base_cost, flood_extra_cost = construction_cost_mln(
+        corridor.length / 1_000.0,
+        final_metrics["forbidden_km"],
+        final_metrics["geology_factor"],
+        config,
     )
 
     anchors = gpd.GeoDataFrame(
@@ -1473,10 +2157,22 @@ def solve_exact_orienteering_bruteforce(
             "served_share": [final_metrics["served_share"]],
             "forbidden_km": [final_metrics["forbidden_km"]],
             "geology_factor": [final_metrics["geology_factor"]],
+            "geology_excess_km": [final_metrics["geology_excess_km"]],
             "water_crossing_km": [final_metrics["water_crossing_km"]],
+            "outside_city_km": [outside_city_km],
+            "outside_city_penalty": [outside_city_penalty],
             "transfer_score": [final_metrics["transfer_score"]],
             "transfer_count": [final_metrics["transfer_count"]],
             "line_overlap_km": [final_metrics["line_overlap_km"]],
+            "turn_penalty": [corridor_turn_metrics["turn_penalty"]],
+            "max_turn_angle_deg": [corridor_turn_metrics["max_turn_angle_deg"]],
+            "mean_turn_angle_deg": [corridor_turn_metrics["mean_turn_angle_deg"]],
+            "sharp_turn_count": [corridor_turn_metrics["sharp_turn_count"]],
+            "curve_radius_violation_m": [corridor_turn_metrics["curve_radius_violation_m"]],
+            "estimated_cost_mln": [estimated_cost],
+            "base_cost_mln": [base_cost],
+            "flood_extra_cost_mln": [flood_extra_cost],
+            "flood_cost_multiplier": [config.flood_cost_multiplier],
             "score": [final_metrics["score"]],
             "anchor_objective_score": [best_metrics["score"]],
             "anchor_served_weight": [best_metrics["served_weight"]],
@@ -1522,6 +2218,7 @@ def compare_exact_and_heuristic(
     weight_col: str = "population",
     max_optional_candidates: int = 8,
     max_selected_candidates: int | None = None,
+    city_boundary: gpd.GeoDataFrame | None = None,
 ) -> tuple[pd.DataFrame, dict[str, dict]]:
     """Compare exact enumeration and heuristic on the same small candidate set."""
 
@@ -1540,6 +2237,7 @@ def compare_exact_and_heuristic(
         weight_col=weight_col,
         max_optional_candidates=max_optional_candidates,
         max_selected_candidates=max_selected_candidates,
+        city_boundary=city_boundary,
     )
     heuristic = solve_orienteering_route(
         demand,
@@ -1550,6 +2248,7 @@ def compare_exact_and_heuristic(
         config=config,
         weight_col=weight_col,
         force_station_count=False,
+        city_boundary=city_boundary,
     )
     rows = []
     for label, result in [("exact", exact), ("heuristic", heuristic)]:
@@ -1564,7 +2263,11 @@ def compare_exact_and_heuristic(
                 "served_share": float(line["served_share"]),
                 "final_score": float(line["score"]),
                 "forbidden_km": float(line["forbidden_km"]),
+                "outside_city_km": float(line.get("outside_city_km", 0.0)),
                 "geology_factor": float(line["geology_factor"]),
+                "geology_excess_km": float(line.get("geology_excess_km", 0.0)),
+                "max_turn_angle_deg": float(line.get("max_turn_angle_deg", 0.0)),
+                "sharp_turn_count": int(line.get("sharp_turn_count", 0)),
                 "evaluated_routes": int(line.get("evaluated_routes", len(result["iteration_log"]))),
             }
         )
@@ -1632,18 +2335,41 @@ def geology_multiplier_for_line(
     cost_col: str = "cost_factor",
     sample_count: int = 80,
 ) -> float:
-    if geology is None or geology.empty or cost_col not in geology.columns:
+    if line.length == 0:
         return 1.0
-    distances = np.linspace(0.0, line.length, max(2, sample_count))
-    factors: list[float] = []
+    excess_km = geology_excess_km_for_line(line, geology, cost_col=cost_col, sample_count=sample_count)
+    return 1.0 + excess_km / (line.length / 1_000.0)
+
+
+def geology_excess_km_for_line(
+    line: LineString,
+    geology: gpd.GeoDataFrame | None,
+    cost_col: str = "cost_factor",
+    sample_count: int = 80,
+) -> float:
+    """Length-weighted excess construction multiplier from geology/cost zones.
+
+    A cost factor of 1.0 is neutral. A 1 km segment through a 1.35 zone adds
+    0.35 geology-excess km.
+    """
+
+    if geology is None or geology.empty or cost_col not in geology.columns:
+        return 0.0
+    if line.length == 0:
+        return 0.0
+
+    sample_count = max(2, sample_count)
+    distances = (np.arange(sample_count, dtype=float) + 0.5) * line.length / sample_count
+    excess_factors: list[float] = []
     for distance in distances:
         point = line.interpolate(distance)
         hits = geology[geology.geometry.covers(point)]
         if hits.empty:
-            factors.append(1.0)
+            excess_factors.append(0.0)
         else:
-            factors.append(float(pd.to_numeric(hits[cost_col], errors="coerce").fillna(1.0).max()))
-    return float(np.mean(factors))
+            cost_factor = float(pd.to_numeric(hits[cost_col], errors="coerce").fillna(1.0).max())
+            excess_factors.append(max(0.0, cost_factor - 1.0))
+    return float(np.mean(excess_factors) * line.length / 1_000.0)
 
 
 def score_line(
@@ -1657,14 +2383,16 @@ def score_line(
     stations = stations_along_line(line, config.station_count, demand.crs)
     served = accessibility_to_stations(demand, stations, weight_col=weight_col, walk_radius_m=config.walk_radius_m)
     forbidden_km = forbidden_length_m(line, forbidden) / 1_000.0
-    geology_factor = geology_multiplier_for_line(line, geology)
+    geology_excess_km = geology_excess_km_for_line(line, geology)
+    geology_factor = 1.0 + geology_excess_km / (line.length / 1_000.0) if line.length else 1.0
     raw_served = float(served["served_weight"].sum())
-    score = raw_served - forbidden_km * config.forbidden_penalty_per_km - (geology_factor - 1.0) * config.geology_penalty
+    score = raw_served - forbidden_km * config.forbidden_penalty_per_km - geology_excess_km * config.geology_penalty_per_km
     return {
         "score": score,
         "served_weight": raw_served,
         "forbidden_km": forbidden_km,
         "geology_factor": geology_factor,
+        "geology_excess_km": geology_excess_km,
         "stations": stations,
     }
 
@@ -1702,6 +2430,7 @@ def optimise_radial_line(
             "served_weight": [best["served_weight"]],
             "forbidden_km": [best["forbidden_km"]],
             "geology_factor": [best["geology_factor"]],
+            "geology_excess_km": [best["geology_excess_km"]],
             "score": [best["score"]],
         },
         geometry=[best["line"]],
@@ -1767,6 +2496,7 @@ def plan_orienteering_network(
     forbidden: gpd.GeoDataFrame | None = None,
     geology: gpd.GeoDataFrame | None = None,
     water_crossings: gpd.GeoDataFrame | None = None,
+    city_boundary: gpd.GeoDataFrame | None = None,
     config: MetroConfig = MetroConfig(),
     n_lines: int = 1,
     weight_col: str = "population",
@@ -1801,6 +2531,7 @@ def plan_orienteering_network(
             water_crossings=water_crossings,
             transfer_points=transfer_points,
             transfer_lines=transfer_lines,
+            city_boundary=city_boundary,
             config=config,
             weight_col="_planning_weight",
             force_station_count=True,
@@ -1852,24 +2583,67 @@ def scenario_metrics(
     total_weight = float(pd.to_numeric(demand[weight_col], errors="coerce").fillna(0.0).sum())
     served_share = weighted_served / total_weight if total_weight else 0.0
     average_factor = float(lines["geology_factor"].mean()) if "geology_factor" in lines else 1.0
-    cost_mln = length_km * config.cost_per_km_mln * average_factor
+    geology_excess = float(lines["geology_excess_km"].sum()) if "geology_excess_km" in lines else 0.0
+    forbidden_km = float(lines["forbidden_km"].sum()) if "forbidden_km" in lines else 0.0
+    if "estimated_cost_mln" in lines:
+        cost_mln = float(lines["estimated_cost_mln"].sum())
+        base_cost_mln = float(lines["base_cost_mln"].sum()) if "base_cost_mln" in lines else length_km * config.cost_per_km_mln * average_factor
+        flood_extra_cost_mln = float(lines["flood_extra_cost_mln"].sum()) if "flood_extra_cost_mln" in lines else 0.0
+    else:
+        cost_mln, base_cost_mln, flood_extra_cost_mln = construction_cost_mln(
+            length_km,
+            forbidden_km,
+            average_factor,
+            config,
+        )
     water_crossing = float(lines["water_crossing_km"].sum()) if "water_crossing_km" in lines else 0.0
+    outside_city = float(lines["outside_city_km"].sum()) if "outside_city_km" in lines else 0.0
+    outside_city_penalty = float(lines["outside_city_penalty"].sum()) if "outside_city_penalty" in lines else 0.0
     transfer_score = float(lines["transfer_score"].sum()) if "transfer_score" in lines else 0.0
     transfer_count = int(lines["transfer_count"].sum()) if "transfer_count" in lines else 0
     line_overlap = float(lines["line_overlap_km"].sum()) if "line_overlap_km" in lines else 0.0
+    turn_penalty = float(lines["turn_penalty"].sum()) if "turn_penalty" in lines else 0.0
+    max_turn_angle = float(lines["max_turn_angle_deg"].max()) if "max_turn_angle_deg" in lines else 0.0
+    mean_turn_angle = float(lines["mean_turn_angle_deg"].mean()) if "mean_turn_angle_deg" in lines else 0.0
+    sharp_turn_count = int(lines["sharp_turn_count"].sum()) if "sharp_turn_count" in lines else 0
+    curve_radius_violation = (
+        float(lines["curve_radius_violation_m"].sum()) if "curve_radius_violation_m" in lines else 0.0
+    )
+    if "spacing_from_previous_m" in stations.columns:
+        spacing = pd.to_numeric(stations["spacing_from_previous_m"], errors="coerce").dropna()
+        avg_spacing = float(spacing.mean()) if not spacing.empty else config.station_spacing_m
+        min_spacing = float(spacing.min()) if not spacing.empty else config.station_spacing_m
+        max_spacing = float(spacing.max()) if not spacing.empty else config.station_spacing_m
+    else:
+        avg_spacing = config.station_spacing_m
+        min_spacing = config.station_spacing_m
+        max_spacing = config.station_spacing_m
     return {
         "scenario": scenario["name"],
         "lines": len(scenario["lines"]),
         "stations": station_count,
         "length_km": length_km,
-        "avg_station_spacing_m": config.station_spacing_m,
+        "avg_station_spacing_m": avg_spacing,
+        "min_station_spacing_m": min_spacing,
+        "max_station_spacing_m": max_spacing,
         "served_weight": weighted_served,
         "served_share": served_share,
         "avg_geology_factor": average_factor,
+        "geology_excess_km": geology_excess,
+        "forbidden_km": forbidden_km,
         "water_crossing_km": water_crossing,
+        "outside_city_km": outside_city,
+        "outside_city_penalty": outside_city_penalty,
         "transfer_count": transfer_count,
         "transfer_score": transfer_score,
         "line_overlap_km": line_overlap,
+        "turn_penalty": turn_penalty,
+        "max_turn_angle_deg": max_turn_angle,
+        "mean_turn_angle_deg": mean_turn_angle,
+        "sharp_turn_count": sharp_turn_count,
+        "curve_radius_violation_m": curve_radius_violation,
+        "base_cost_mln": base_cost_mln,
+        "flood_extra_cost_mln": flood_extra_cost_mln,
         "estimated_cost_mln": cost_mln,
     }
 
@@ -1877,7 +2651,28 @@ def scenario_metrics(
 def scenario_summary_table(scenarios: Mapping[str, dict], demand: gpd.GeoDataFrame) -> pd.DataFrame:
     rows = [scenario_metrics(scenario, demand) for scenario in scenarios.values()]
     table = pd.DataFrame(rows)
-    for col in ["length_km", "served_share", "avg_geology_factor", "water_crossing_km", "transfer_score", "line_overlap_km", "estimated_cost_mln"]:
+    for col in [
+        "length_km",
+        "avg_station_spacing_m",
+        "min_station_spacing_m",
+        "max_station_spacing_m",
+        "served_share",
+        "avg_geology_factor",
+        "geology_excess_km",
+        "forbidden_km",
+        "water_crossing_km",
+        "outside_city_km",
+        "outside_city_penalty",
+        "transfer_score",
+        "line_overlap_km",
+        "turn_penalty",
+        "max_turn_angle_deg",
+        "mean_turn_angle_deg",
+        "curve_radius_violation_m",
+        "base_cost_mln",
+        "flood_extra_cost_mln",
+        "estimated_cost_mln",
+    ]:
         table[col] = table[col].astype(float)
     return table
 
@@ -1903,6 +2698,7 @@ def build_orienteering_scenarios(
     forbidden: gpd.GeoDataFrame | None,
     geology: gpd.GeoDataFrame | None,
     water_crossings: gpd.GeoDataFrame | None = None,
+    city_boundary: gpd.GeoDataFrame | None = None,
     base_config: MetroConfig = MetroConfig(),
 ) -> dict[str, dict]:
     return {
@@ -1913,6 +2709,7 @@ def build_orienteering_scenarios(
             forbidden,
             geology,
             water_crossings=water_crossings,
+            city_boundary=city_boundary,
             config=base_config,
             n_lines=1,
             name="1 linia - orienteering",
@@ -1924,6 +2721,7 @@ def build_orienteering_scenarios(
             forbidden,
             geology,
             water_crossings=water_crossings,
+            city_boundary=city_boundary,
             config=base_config,
             n_lines=2,
             name="2 linie - orienteering",
@@ -1935,6 +2733,7 @@ def build_orienteering_scenarios(
             forbidden,
             geology,
             water_crossings=water_crossings,
+            city_boundary=city_boundary,
             config=base_config,
             n_lines=3,
             name="3 linie - orienteering",
@@ -2054,6 +2853,7 @@ def plot_scenario_satellite(
     geology: gpd.GeoDataFrame | None = None,
     demand_areas: gpd.GeoDataFrame | None = None,
     water_crossings: gpd.GeoDataFrame | None = None,
+    city_boundary: gpd.GeoDataFrame | None = None,
     centre_area: gpd.GeoDataFrame | None = None,
     weight_col: str = "population",
     figsize: tuple[int, int] = (10, 10),
@@ -2073,14 +2873,30 @@ def plot_scenario_satellite(
     set_padded_extent(ax, extent)
     add_satellite_basemap(ax)
 
+    if city_boundary is not None and not city_boundary.empty:
+        _align_crs(city_boundary, target_crs).boundary.plot(
+            ax=ax,
+            color="#ffffff",
+            alpha=0.95,
+            linewidth=2.0,
+            zorder=7,
+        )
+        _align_crs(city_boundary, target_crs).boundary.plot(
+            ax=ax,
+            color="#111111",
+            alpha=0.95,
+            linewidth=0.9,
+            zorder=8,
+        )
+
     if demand_areas is not None and not demand_areas.empty:
         areas = _align_crs(demand_areas, target_crs)
         column = "population_density" if "population_density" in areas.columns else weight_col
         areas.plot(
             ax=ax,
             column=column,
-            cmap="Greys",
-            alpha=0.50,
+            cmap="YlGn",
+            alpha=0.46,
             edgecolor="none",
             legend=True,
             zorder=2,
@@ -2130,17 +2946,17 @@ def plot_scenario_satellite(
         _align_crs(centre_area, target_crs).plot(
             ax=ax,
             facecolor="none",
-            edgecolor="#ffffff",
-            linewidth=3.6,
+            edgecolor="#111111",
+            linewidth=4.4,
             linestyle="-",
             zorder=8,
         )
         _align_crs(centre_area, target_crs).plot(
             ax=ax,
             facecolor="none",
-            edgecolor="#111111",
-            linewidth=1.7,
-            linestyle="--",
+            edgecolor="#ffd60a",
+            linewidth=2.4,
+            linestyle="-",
             zorder=9,
         )
 
@@ -2174,7 +2990,8 @@ def plot_scenario_satellite(
 
     if centres is not None and not centres.empty:
         centres_map = _align_crs(centres, target_crs)
-        centres_map.plot(ax=ax, markersize=170, marker="*", color="#ffffff", edgecolor="#111111", linewidth=1.2, zorder=24)
+        centres_map.plot(ax=ax, markersize=220, marker="*", color="#111111", edgecolor="#111111", linewidth=1.2, zorder=24)
+        centres_map.plot(ax=ax, markersize=145, marker="*", color="#ffd60a", edgecolor="#111111", linewidth=0.8, zorder=25)
 
     ax.set_title(f"{scenario['name']} - mapa satelitarna")
     ax.set_axis_off()
@@ -2192,6 +3009,7 @@ def plot_scenario(
     geology: gpd.GeoDataFrame | None = None,
     demand_areas: gpd.GeoDataFrame | None = None,
     water_crossings: gpd.GeoDataFrame | None = None,
+    city_boundary: gpd.GeoDataFrame | None = None,
     centre_area: gpd.GeoDataFrame | None = None,
     weight_col: str = "population",
     figsize: tuple[int, int] = (10, 10),
@@ -2210,8 +3028,8 @@ def plot_scenario(
         areas.plot(
             ax=ax,
             column=column,
-            cmap="YlGnBu",
-            alpha=0.58,
+            cmap="YlGn",
+            alpha=0.54,
             edgecolor="#ffffff",
             linewidth=0.12,
             legend=True,
@@ -2236,8 +3054,17 @@ def plot_scenario(
             linewidth=0.45,
         )
 
+    if city_boundary is not None and not city_boundary.empty:
+        _align_crs(city_boundary, demand.crs).boundary.plot(
+            ax=ax,
+            color="#111111",
+            alpha=0.88,
+            linewidth=1.5,
+            linestyle="--",
+        )
+
     if forbidden is not None and not forbidden.empty:
-        _align_crs(forbidden, demand.crs).plot(ax=ax, color="#79b7d9", alpha=0.45, edgecolor="#2f6f95", linewidth=0.8)
+        _align_crs(forbidden, demand.crs).plot(ax=ax, color="#ff3b30", alpha=0.32, edgecolor="#7a1111", linewidth=0.8)
 
     if regional_clusters is not None and not regional_clusters.empty:
         clusters = _align_crs(regional_clusters, demand.crs)
@@ -2248,8 +3075,15 @@ def plot_scenario(
             ax=ax,
             facecolor="none",
             edgecolor="#111111",
-            linewidth=2.2,
-            linestyle="--",
+            linewidth=3.8,
+            linestyle="-",
+        )
+        _align_crs(centre_area, demand.crs).plot(
+            ax=ax,
+            facecolor="none",
+            edgecolor="#ffd60a",
+            linewidth=2.0,
+            linestyle="-",
         )
 
     sizes = np.sqrt(pd.to_numeric(demand[weight_col], errors="coerce").fillna(0.0)) * 1.2
@@ -2276,7 +3110,9 @@ def plot_scenario(
         station_part.plot(ax=ax, color="white", edgecolor=colour, markersize=44, linewidth=1.4)
 
     if centres is not None and not centres.empty:
-        _align_crs(centres, demand.crs).plot(ax=ax, markersize=120, marker="*", color="#111111")
+        centres_map = _align_crs(centres, demand.crs)
+        centres_map.plot(ax=ax, markersize=160, marker="*", color="#111111", edgecolor="#111111", linewidth=1.0)
+        centres_map.plot(ax=ax, markersize=105, marker="*", color="#ffd60a", edgecolor="#111111", linewidth=0.6)
 
     ax.set_title(scenario["name"])
     ax.set_axis_off()

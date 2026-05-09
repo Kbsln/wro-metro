@@ -4,6 +4,17 @@ Ta instrukcja opisuje, jak przygotowac warstwe `data/raw/flood_zones.geojson`,
 ktora notebook `01_wroclaw_metro_planner.ipynb` automatycznie wczyta jako
 obszary zagrozenia powodziowego.
 
+Jesli QGIS sprawia problem, najprostsza sciezka w tym projekcie to pobranie
+danych z API/WFS skryptem:
+
+```powershell
+py -3.11 scripts\download_flood_zones_isok.py
+```
+
+Skrypt korzysta z oficjalnej uslugi WFS ISOK/Wod Polskich, pobiera
+`nz-core:HazardArea`, przycina wynik do granicy Wroclawia i zapisuje
+`data/raw/flood_zones.geojson`.
+
 Najwazniejsze rozroznienie: warstwa `wody-powierzchniowe.zip` z SIP Wroclaw
 pokazuje rzeki, kanaly i zbiorniki. To nie jest mapa zalewowa. Do obszarow
 zalewowych uzywamy MZP, czyli Map Zagrozenia Powodziowego z Wod Polskich /
@@ -78,6 +89,41 @@ Ta warstwa bedzie maska do przyciecia MZP tylko do Wroclawia.
    - jezeli jest WMS/raster, to jest tylko obraz do podgladu. Wtedy uzyj opcji
      pobierania danych przestrzennych we wtyczce albo pobierz paczke wektorowa
      z Hydroportalu/SIGW.
+
+### Jesli MZP widac na mapie, ale nie da sie jej wybrac w `Clip`
+
+To prawie zawsze oznacza, ze dodana warstwa jest WMS/WMTS, czyli obraz mapy.
+Jest widoczna w projekcie, ale QGIS nie pokazuje jej w narzedziach wektorowych,
+bo nie ma tam obiektow typu `Polygon`.
+
+Wtedy dodaj MZP jako WFS:
+
+1. Wejdz w `Warstwa` -> `Menedzer zrodel danych`.
+2. Wybierz `WFS / OGC API - Features`.
+3. Kliknij `Nowy`.
+4. Nazwa: `ISOK MZP MRP WFS`.
+5. URL:
+
+   ```text
+   https://wody.isok.gov.pl/wss/INSPIRE/INSPIRE_NZ_HY_MZPMRP_WFS?REQUEST=GetCapabilities&SERVICE=WFS&VERSION=2.0.0
+   ```
+
+6. Kliknij `OK`, potem `Polacz`.
+7. Z listy warstw wybierz najpierw `nz-core:HazardArea`. To jest najlepszy
+   kandydat dla Map Zagrozenia Powodziowego.
+8. Jezeli QGIS daje taka opcje, zaznacz pobieranie tylko obiektow z biezacego
+   zakresu mapy. Najpierw przybliz widok na Wroclaw, bo krajowa usluga WFS moze
+   byc wolna.
+9. Dodaj warstwe do projektu.
+
+Po dodaniu WFS sprawdz:
+
+- prawy klik na warstwe -> `Otworz tabele atrybutow`,
+- prawy klik -> `Wlasciwosci` -> `Informacje`,
+- typ geometrii powinien byc poligonowy.
+
+Dopiero taka warstwa pojawi sie w narzedziu `Przytnij` jako `Warstwa
+wejsciowa`.
 
 ## 5. Przyciecie MZP do Wroclawia
 
@@ -171,6 +217,9 @@ obszarach zalewowych powinien przestac mowic, ze brakuje lokalnej warstwy MZP.
   MZP. Warstwa wektorowa powinna pozwalac otworzyc `Tabele atrybutow`,
   miec liczbe obiektow wieksza niz 0 i typ geometrii `Polygon` lub
   `MultiPolygon`.
+- MZP widac w panelu warstw, ale nie ma jej na liscie w `Clip`: to tez oznacza,
+  ze QGIS widzi ja jako raster/WMS, a nie jako wektor. Dodaj ja przez WFS albo
+  pobierz dane przestrzenne i zapisz lokalnie jako GPKG/GeoJSON.
 - Notebook dalej nie widzi danych: sprawdz dokladna nazwe i lokalizacje pliku:
   `data/raw/flood_zones.geojson`.
 - Mapa w notebooku wyglada dziwnie przesunieta: sprawdz, czy eksport mial

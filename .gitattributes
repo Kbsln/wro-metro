@@ -1,0 +1,10 @@
+*.ipynb text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.geojson text eol=lf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.zip binary
