@@ -39,7 +39,11 @@ class MetroConfig:
     cost_per_km_mln: float = 650.0
     angle_step_deg: float = 2.0
     forbidden_penalty_per_km: float = 2_500.0
+    # Legacy flat penalty (kept for compatibility). Prefer using
+    # geology_penalty_per_km which scales with geology-excess km.
     geology_penalty: float = 1_000.0
+    # Penalty applied per geology-excess kilometre (see geology_excess_km_for_line).
+    geology_penalty_per_km: float = 1_000.0
     river_crossing_bonus_per_km: float = 600.0
     transfer_bonus_per_interchange: float = 35_000.0
     interchange_radius_m: float = 450.0
@@ -309,14 +313,67 @@ def load_geology_cost_layer_from_raw(
     """Load a real geology/cost multiplier layer if the user supplies one."""
 
     data_dir = Path(data_dir)
-    for name in ["geology.geojson", "geology.gpkg", "geology.shp", "cost_zones.geojson", "cost_zones.gpkg"]:
+
+    # candidate filenames and common alternatives (zip included)
+    candidates = [
+        "geology.geojson",
+        "geology.gpkg",
+        "geology.shp",
+        "geology.zip",
+        "cost_zones.geojson",
+        "cost_zones.gpkg",
+        "cost_zones.shp",
+        "cost_zones.zip",
+    ]
+
+    # try top-level files first
+    for name in candidates:
         path = data_dir / name
         if path.exists():
-            geology = gpd.read_file(path).to_crs(target_crs)
-            if "cost_factor" not in geology.columns:
+            try:
+                geology = gpd.read_file(path).to_crs(target_crs)
+            except Exception:
+                # try reading as a zipped shapefile
+                try:
+                    geology = gpd.read_file(f"zip://{path}")
+                    geology = geology.to_crs(target_crs)
+                except Exception:
+                    continue
+
+            # normalize common cost column names to `cost_factor`
+            common_cost_cols = ["cost_factor", "cost", "factor", "multiplier", "mult", "cost_multip"]
+            found = None
+            for col in common_cost_cols:
+                if col in geology.columns:
+                    found = col
+                    break
+            if found and found != "cost_factor":
+                geology["cost_factor"] = pd.to_numeric(geology[found], errors="coerce").fillna(1.0)
+            elif "cost_factor" not in geology.columns:
                 geology["cost_factor"] = 1.0
+
             geology["source_layer"] = name
             return geology
+
+    # try a geology/ folder with shapefiles
+    folder = data_dir / "geology"
+    if folder.exists() and folder.is_dir():
+        shapefiles = sorted(folder.glob("*.shp"))
+        if shapefiles:
+            geology = gpd.read_file(shapefiles[0]).to_crs(target_crs)
+            common_cost_cols = ["cost_factor", "cost", "factor", "multiplier", "mult", "cost_multip"]
+            found = None
+            for col in common_cost_cols:
+                if col in geology.columns:
+                    found = col
+                    break
+            if found and found != "cost_factor":
+                geology["cost_factor"] = pd.to_numeric(geology[found], errors="coerce").fillna(1.0)
+            elif "cost_factor" not in geology.columns:
+                geology["cost_factor"] = 1.0
+            geology["source_layer"] = f"geology/{shapefiles[0].name}"
+            return geology
+
     return None
 
 
@@ -758,6 +815,12 @@ def route_geology_factor(points: list[Point], geology: gpd.GeoDataFrame | None) 
     return geology_multiplier_for_line(route_polyline(points), geology)
 
 
+def route_geology_excess_km(points: list[Point], geology: gpd.GeoDataFrame | None) -> float:
+    if len(points) < 2:
+        return 0.0
+    return geology_excess_km_for_line(route_polyline(points), geology)
+
+
 def water_crossing_km(points: list[Point], water_crossings: gpd.GeoDataFrame | None) -> float:
     union = forbidden_union(water_crossings)
     if union is None or union.is_empty or len(points) < 2:
@@ -835,6 +898,7 @@ def route_score_from_points(
             "route_length_m": 0.0,
             "forbidden_km": 0.0,
             "geology_factor": 1.0,
+            "geology_excess_km": 0.0,
             "water_crossing_km": 0.0,
             "transfer_score": 0.0,
             "transfer_count": 0,
@@ -849,13 +913,16 @@ def route_score_from_points(
     total_weight = float(weights.sum())
     served_weight = float(np.sum(weights * coverage_score))
     forbidden_km = route_forbidden_km(points, forbidden)
-    geology_factor = route_geology_factor(points, geology)
+    geology_excess_km = route_geology_excess_km(points, geology)
+    route_km = route_length_m(points) / 1_000.0
+    geology_factor = 1.0 + geology_excess_km / route_km if route_km else 1.0
     water_km = water_crossing_km(points, water_crossings)
     transfer_score, transfer_count = transfer_interchange_score(points, transfer_points, transfer_lines, config)
     overlap_km = line_overlap_km(points, existing_lines if existing_lines is not None else transfer_lines, config)
     score = served_weight
     score -= forbidden_km * config.forbidden_penalty_per_km
-    score -= max(0.0, geology_factor - 1.0) * config.geology_penalty
+    # geology_excess_km is already in kilometres; apply per-km penalty.
+    score -= geology_excess_km * config.geology_penalty_per_km
     score -= overlap_km * config.line_overlap_penalty_per_km
     score += water_km * config.river_crossing_bonus_per_km
     score += transfer_score
@@ -866,6 +933,7 @@ def route_score_from_points(
         "route_length_m": route_length_m(points),
         "forbidden_km": forbidden_km,
         "geology_factor": geology_factor,
+        "geology_excess_km": geology_excess_km,
         "water_crossing_km": water_km,
         "transfer_score": transfer_score,
         "transfer_count": transfer_count,
@@ -984,6 +1052,7 @@ def solve_orienteering_route(
         demand,
         nodes,
         forbidden_geom,
+        geology,
         config,
         weight_col,
         water_geom=water_geom,
@@ -1125,6 +1194,7 @@ def solve_orienteering_route(
             "served_share": [final_metrics["served_share"]],
             "forbidden_km": [final_metrics["forbidden_km"]],
             "geology_factor": [final_metrics["geology_factor"]],
+            "geology_excess_km": [final_metrics["geology_excess_km"]],
             "water_crossing_km": [final_metrics["water_crossing_km"]],
             "transfer_score": [final_metrics["transfer_score"]],
             "transfer_count": [final_metrics["transfer_count"]],
@@ -1181,6 +1251,7 @@ def _fast_orienteering_matrices(
     demand: gpd.GeoDataFrame,
     nodes: list[dict],
     forbidden_geom,
+    geology: gpd.GeoDataFrame | None,
     config: MetroConfig,
     weight_col: str,
     water_geom=None,
@@ -1200,6 +1271,15 @@ def _fast_orienteering_matrices(
                 value = float(segment.intersection(forbidden_geom).length / 1_000.0)
                 forbidden_matrix[left, right] = value
                 forbidden_matrix[right, left] = value
+
+    geology_excess_matrix = np.zeros_like(distance_matrix)
+    if geology is not None and not geology.empty:
+        for left in range(len(nodes)):
+            for right in range(left + 1, len(nodes)):
+                segment = LineString([tuple(node_xy[left]), tuple(node_xy[right])])
+                value = geology_excess_km_for_line(segment, geology, sample_count=24)
+                geology_excess_matrix[left, right] = value
+                geology_excess_matrix[right, left] = value
 
     water_matrix = np.zeros_like(distance_matrix)
     if water_geom is not None and not water_geom.is_empty:
@@ -1248,6 +1328,7 @@ def _fast_orienteering_matrices(
     return {
         "distance_matrix": distance_matrix,
         "forbidden_matrix": forbidden_matrix,
+        "geology_excess_matrix": geology_excess_matrix,
         "water_matrix": water_matrix,
         "transfer_segment_matrix": transfer_segment_matrix,
         "transfer_point_coverage": transfer_point_coverage,
@@ -1267,10 +1348,12 @@ def _fast_order_metrics(order: list[int], matrices: Mapping, config: MetroConfig
             "route_length_m": 0.0,
             "forbidden_km": 0.0,
             "geology_factor": 1.0,
+            "geology_excess_km": 0.0,
         }
 
     distance_matrix = matrices["distance_matrix"]
     forbidden_matrix = matrices["forbidden_matrix"]
+    geology_excess_matrix = matrices.get("geology_excess_matrix", np.zeros_like(distance_matrix))
     water_matrix = matrices.get("water_matrix", np.zeros_like(distance_matrix))
     transfer_segment_matrix = matrices.get("transfer_segment_matrix", np.zeros_like(distance_matrix))
     transfer_point_coverage = matrices.get("transfer_point_coverage", np.zeros(len(distance_matrix)))
@@ -1284,12 +1367,14 @@ def _fast_order_metrics(order: list[int], matrices: Mapping, config: MetroConfig
         right = np.array(order[1:], dtype=int)
         length_m = float(distance_matrix[left, right].sum())
         forbidden_km = float(forbidden_matrix[left, right].sum())
+        geology_excess_km = float(geology_excess_matrix[left, right].sum())
         water_km = float(water_matrix[left, right].sum())
         transfer_segment_count = int(min(2, transfer_segment_matrix[left, right].sum()))
         overlap_km = float(overlap_matrix[left, right].sum())
     else:
         length_m = 0.0
         forbidden_km = 0.0
+        geology_excess_km = 0.0
         water_km = 0.0
         transfer_segment_count = 0
         overlap_km = 0.0
@@ -1299,7 +1384,11 @@ def _fast_order_metrics(order: list[int], matrices: Mapping, config: MetroConfig
     transfer_point_count = int(min(2, transfer_point_coverage[np.array(order, dtype=int)].sum()))
     transfer_count = int(min(3, transfer_point_count + transfer_segment_count))
     transfer_score = float(transfer_count * config.transfer_bonus_per_interchange)
+    route_km = length_m / 1_000.0
+    geology_factor = 1.0 + geology_excess_km / route_km if route_km else 1.0
     score = served_weight - forbidden_km * config.forbidden_penalty_per_km
+    # geology_excess_km is in kilometres; apply per-km penalty.
+    score -= geology_excess_km * config.geology_penalty_per_km
     score -= overlap_km * config.line_overlap_penalty_per_km
     score += water_km * config.river_crossing_bonus_per_km
     score += transfer_score
@@ -1309,7 +1398,8 @@ def _fast_order_metrics(order: list[int], matrices: Mapping, config: MetroConfig
         "served_share": served_weight / total_weight if total_weight else 0.0,
         "route_length_m": length_m,
         "forbidden_km": forbidden_km,
-        "geology_factor": 1.0,
+        "geology_factor": geology_factor,
+        "geology_excess_km": geology_excess_km,
         "water_crossing_km": water_km,
         "transfer_score": transfer_score,
         "transfer_count": transfer_count,
@@ -1393,7 +1483,7 @@ def solve_exact_orienteering_bruteforce(
     )
 
     nodes = _nodes_from_candidates(candidates, centre)
-    matrices = _fast_orienteering_matrices(demand, nodes, forbidden_geom, config, weight_col)
+    matrices = _fast_orienteering_matrices(demand, nodes, forbidden_geom, geology, config, weight_col)
     distance_matrix = matrices["distance_matrix"]
     optional_ids = list(range(1, len(nodes)))
     max_selected = len(optional_ids) if max_selected_candidates is None else min(max_selected_candidates, len(optional_ids))
@@ -1473,6 +1563,7 @@ def solve_exact_orienteering_bruteforce(
             "served_share": [final_metrics["served_share"]],
             "forbidden_km": [final_metrics["forbidden_km"]],
             "geology_factor": [final_metrics["geology_factor"]],
+            "geology_excess_km": [final_metrics["geology_excess_km"]],
             "water_crossing_km": [final_metrics["water_crossing_km"]],
             "transfer_score": [final_metrics["transfer_score"]],
             "transfer_count": [final_metrics["transfer_count"]],
@@ -1565,6 +1656,7 @@ def compare_exact_and_heuristic(
                 "final_score": float(line["score"]),
                 "forbidden_km": float(line["forbidden_km"]),
                 "geology_factor": float(line["geology_factor"]),
+                "geology_excess_km": float(line.get("geology_excess_km", 0.0)),
                 "evaluated_routes": int(line.get("evaluated_routes", len(result["iteration_log"]))),
             }
         )
@@ -1632,18 +1724,41 @@ def geology_multiplier_for_line(
     cost_col: str = "cost_factor",
     sample_count: int = 80,
 ) -> float:
-    if geology is None or geology.empty or cost_col not in geology.columns:
+    if line.length == 0:
         return 1.0
-    distances = np.linspace(0.0, line.length, max(2, sample_count))
-    factors: list[float] = []
+    excess_km = geology_excess_km_for_line(line, geology, cost_col=cost_col, sample_count=sample_count)
+    return 1.0 + excess_km / (line.length / 1_000.0)
+
+
+def geology_excess_km_for_line(
+    line: LineString,
+    geology: gpd.GeoDataFrame | None,
+    cost_col: str = "cost_factor",
+    sample_count: int = 80,
+) -> float:
+    """Length-weighted excess construction multiplier from geology/cost zones.
+
+    A cost factor of 1.0 is neutral. A 1 km segment through a 1.35 zone adds
+    0.35 geology-excess km, which is then multiplied by ``config.geology_penalty``.
+    """
+
+    if geology is None or geology.empty or cost_col not in geology.columns:
+        return 0.0
+    if line.length == 0:
+        return 0.0
+
+    sample_count = max(2, sample_count)
+    distances = (np.arange(sample_count, dtype=float) + 0.5) * line.length / sample_count
+    excess_factors: list[float] = []
     for distance in distances:
         point = line.interpolate(distance)
         hits = geology[geology.geometry.covers(point)]
         if hits.empty:
-            factors.append(1.0)
+            excess_factors.append(0.0)
         else:
-            factors.append(float(pd.to_numeric(hits[cost_col], errors="coerce").fillna(1.0).max()))
-    return float(np.mean(factors))
+            cost_factor = float(pd.to_numeric(hits[cost_col], errors="coerce").fillna(1.0).max())
+            excess_factors.append(max(0.0, cost_factor - 1.0))
+    return float(np.mean(excess_factors) * line.length / 1_000.0)
 
 
 def score_line(
@@ -1657,14 +1772,17 @@ def score_line(
     stations = stations_along_line(line, config.station_count, demand.crs)
     served = accessibility_to_stations(demand, stations, weight_col=weight_col, walk_radius_m=config.walk_radius_m)
     forbidden_km = forbidden_length_m(line, forbidden) / 1_000.0
-    geology_factor = geology_multiplier_for_line(line, geology)
+    geology_excess_km = geology_excess_km_for_line(line, geology)
+    geology_factor = 1.0 + geology_excess_km / (line.length / 1_000.0) if line.length else 1.0
     raw_served = float(served["served_weight"].sum())
-    score = raw_served - forbidden_km * config.forbidden_penalty_per_km - (geology_factor - 1.0) * config.geology_penalty
+    # geology_excess_km in km -> multiply by per-km penalty
+    score = raw_served - forbidden_km * config.forbidden_penalty_per_km - geology_excess_km * config.geology_penalty_per_km
     return {
         "score": score,
         "served_weight": raw_served,
         "forbidden_km": forbidden_km,
         "geology_factor": geology_factor,
+        "geology_excess_km": geology_excess_km,
         "stations": stations,
     }
 
@@ -1702,6 +1820,7 @@ def optimise_radial_line(
             "served_weight": [best["served_weight"]],
             "forbidden_km": [best["forbidden_km"]],
             "geology_factor": [best["geology_factor"]],
+            "geology_excess_km": [best["geology_excess_km"]],
             "score": [best["score"]],
         },
         geometry=[best["line"]],
@@ -1852,6 +1971,7 @@ def scenario_metrics(
     total_weight = float(pd.to_numeric(demand[weight_col], errors="coerce").fillna(0.0).sum())
     served_share = weighted_served / total_weight if total_weight else 0.0
     average_factor = float(lines["geology_factor"].mean()) if "geology_factor" in lines else 1.0
+    geology_excess = float(lines["geology_excess_km"].sum()) if "geology_excess_km" in lines else 0.0
     cost_mln = length_km * config.cost_per_km_mln * average_factor
     water_crossing = float(lines["water_crossing_km"].sum()) if "water_crossing_km" in lines else 0.0
     transfer_score = float(lines["transfer_score"].sum()) if "transfer_score" in lines else 0.0
@@ -1866,6 +1986,7 @@ def scenario_metrics(
         "served_weight": weighted_served,
         "served_share": served_share,
         "avg_geology_factor": average_factor,
+        "geology_excess_km": geology_excess,
         "water_crossing_km": water_crossing,
         "transfer_count": transfer_count,
         "transfer_score": transfer_score,
@@ -1877,7 +1998,7 @@ def scenario_metrics(
 def scenario_summary_table(scenarios: Mapping[str, dict], demand: gpd.GeoDataFrame) -> pd.DataFrame:
     rows = [scenario_metrics(scenario, demand) for scenario in scenarios.values()]
     table = pd.DataFrame(rows)
-    for col in ["length_km", "served_share", "avg_geology_factor", "water_crossing_km", "transfer_score", "line_overlap_km", "estimated_cost_mln"]:
+    for col in ["length_km", "served_share", "avg_geology_factor", "geology_excess_km", "water_crossing_km", "transfer_score", "line_overlap_km", "estimated_cost_mln"]:
         table[col] = table[col].astype(float)
     return table
 

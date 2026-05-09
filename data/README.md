@@ -10,7 +10,7 @@ Proponowane pliki wejściowe:
 - `data/raw/wody-powierzchniowe.zip` z wodami powierzchniowymi SIP; to warstwa rzek/wody do oceny przeciec komunikacyjnych, nie mapa zalewowa i nie zakaz dla metra.
 - `data/raw/flood_zones.geojson`, `data/raw/flood_zones.gpkg`, `data/raw/flood_zones.zip` albo shapefile obszarow zagrozenia powodziowego z Hydroportalu ISOK.
 - `data/raw/polling_places.csv` z kolumnami `address`, `votes`, opcjonalnie `lat`, `lon`.
-- `data/raw/geology.geojson` albo warstwa odwiertow/geologii z kolumna `cost_factor`, jesli chcesz modelowac koszt geologiczny.
+- `data/raw/geology.geojson`, `data/raw/geology.gpkg`, `data/raw/geology.zip` albo odpowiednia warstwa `cost_zones` z kolumna `cost_factor`; `1.0` oznacza teren neutralny, a wyzsze wartosci nakladaja kare za trudniejsza budowe. Plik `geology.geojson` mozna wygenerowac skryptem `scripts/download_geology_data.py` z uslugi PIG-PIB/CBDG Mapa Litogenetyczna Polski 1:50 000; `cost_factor` jest heurystyka kosztowa wyprowadzona z typu litologii.
 
 Notebook ma dane demo, wiec uruchamia sie bez tych plikow. Po pobraniu danych realnych podmieniasz tylko sekcje ladowania danych.
 
@@ -22,4 +22,10 @@ Pobranie oficjalnych paczek SIP:
 
 ```powershell
 py -3.11 scripts\download_wroclaw_data.py
+```
+
+Pobranie geologii/litologii dla obszaru Wroclawia:
+
+```powershell
+py -3.11 scripts\download_geology_data.py
 ```
