@@ -65,6 +65,11 @@ def test_route_score_applies_geology_penalty_per_km():
         turn_penalty_per_degree=0.0,
         minimum_curve_radius_m=0.0,
         curve_radius_penalty_per_m=0.0,
+        station_geology_penalty_per_excess=0.0,
+        station_high_geology_penalty=0.0,
+        high_geology_penalty_per_km=0.0,
+        corridor_detour_penalty_per_ratio=0.0,
+        corridor_backtrack_penalty_per_km=0.0,
     )
 
     metrics = pl.route_score_from_points(points, demand, None, geology, config, weight_col="population")

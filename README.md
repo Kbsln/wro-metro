@@ -13,9 +13,11 @@ Model bazowy:
 - popyt jest rysowany jako obszary demograficzne, a wazone punkty sa tylko techniczna reprezentacja obszarow w algorytmie,
 - strefy zalewowe sa traktowane jako obszary ryzyka, a popyt lezacy w nich jest przesuwany do najblizszego wolnego punktu,
 - warstwa zalewowa nie jest generowana z rzek; trzeba dodac realne MZP/ISOK jako `data/raw/flood_zones.geojson`,
-- warstwa geologiczna/kosztowa jest wczytywana z `data/raw/geology.geojson` albo `data/raw/cost_zones.*`; kolumna `cost_factor` powyzej `1.0` podnosi koszt i kare za trudniejszy teren,
+- warstwa geologiczna/kosztowa jest wczytywana z `data/raw/geology.geojson` albo `data/raw/cost_zones.*`; kolumna `cost_factor` powyzej `1.0` podnosi koszt i kare za trudniejszy teren, a `cost_factor >= 1.5` jest traktowany jako wysokie ryzyko geologiczne,
 - rzeka i wody powierzchniowe nie sa zakazem dla metra; sa bariera komunikacyjna, ktorej przecięcie moze poprawic siec,
+- stacje i kotwice unikaja wod powierzchniowych oraz buforow MZP, nawet gdy sam tunel moze przeciac rzeke,
 - regionalne centra popytu sa klastrami obszarow demograficznych, a nie recznie wpisanymi punktami,
+- kandydaci na kotwice maja minimalna reprezentacje sektorow miasta, zeby poludnie/wschod/zachod/polnoc nie znikaly przy dominacji centrum,
 - kandydaci na kotwice stacji maja wage z lokalnego zasiegu dojscia, dzieki czemu okolice centrum nie sa redukowane do jednej wymuszonej kropki,
 - kotwice stacji lezace w MZP albo w buforze mozliwych podtopien sa przesuwane do najblizszego miejsca poza strefa ryzyka,
 - glowny algorytm to orienteering / prize-collecting TSP: komiwojazer z nagrodami i limitem dlugosci, czyli problem NP-trudny laczacy idee TSP i plecaka,
@@ -57,6 +59,13 @@ Skrypt zapisuje `data/raw/geology.geojson`. Pole `cost_factor` jest heurystyka
 trudnosci budowy wyprowadzona z litologii. Solver przelicza je na
 `geology_excess_km`: np. 1 km przez obszar `cost_factor = 1.35` daje 0,35 km
 nadwyzki geologicznej, a ta nadwyzka jest karana przez `geology_penalty_per_km`.
+Dodatkowo trudna geologia obniza atrakcyjnosc kandydatow na kotwice i stacje,
+a odcinki `cost_factor >= 1.5` dostaja osobna kare `high_geology_penalty_per_km`.
+Algorytm karze tez zbyt objazdowe i cofajace sie korytarze, zeby ograniczyc
+efekt "TSP po punktach" i promowac naturalniejsze ramiona linii.
+Kolejne linie mocniej wygaszaja popyt w obszarach juz obsluzonych i dostaja
+wyzsza kare za przebieg w szerszym buforze poprzednich linii, co zmniejsza
+ryzyko planowania dwoch nitek w ten sam rejon miasta.
 
 ## Uruchomienie
 
