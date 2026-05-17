@@ -16,6 +16,7 @@ Model bazowy:
 - warstwa geologiczna/kosztowa jest wczytywana z `data/raw/geology.geojson` albo `data/raw/cost_zones.*`; kolumna `cost_factor` powyzej `1.0` podnosi koszt i kare za trudniejszy teren, a `cost_factor >= 1.5` jest traktowany jako wysokie ryzyko geologiczne,
 - rzeka i wody powierzchniowe nie sa zakazem dla metra; sa bariera komunikacyjna, ktorej przecięcie moze poprawic siec,
 - stacje i kotwice unikaja wod powierzchniowych oraz buforow MZP, nawet gdy sam tunel moze przeciac rzeke,
+- trasy dostaja bardzo duza kare nadmiarowa za wychodzenie poza granice miasta i za dlugi przebieg w buforze juz zaplanowanej linii,
 - regionalne centra popytu sa klastrami obszarow demograficznych, a nie recznie wpisanymi punktami,
 - kandydaci na kotwice maja minimalna reprezentacje sektorow miasta, zeby poludnie/wschod/zachod/polnoc nie znikaly przy dominacji centrum,
 - kandydaci na kotwice stacji maja wage z lokalnego zasiegu dojscia, dzieki czemu okolice centrum nie sa redukowane do jednej wymuszonej kropki,
@@ -64,8 +65,20 @@ a odcinki `cost_factor >= 1.5` dostaja osobna kare `high_geology_penalty_per_km`
 Algorytm karze tez zbyt objazdowe i cofajace sie korytarze, zeby ograniczyc
 efekt "TSP po punktach" i promowac naturalniejsze ramiona linii.
 Kolejne linie mocniej wygaszaja popyt w obszarach juz obsluzonych i dostaja
-wyzsza kare za przebieg w szerszym buforze poprzednich linii, co zmniejsza
-ryzyko planowania dwoch nitek w ten sam rejon miasta.
+wyzsza kare za prawie rownolegly przebieg w szerszym buforze poprzednich linii,
+co zmniejsza ryzyko planowania dwoch nitek w ten sam rejon miasta. Zwykle
+przeciecie pod katem jest traktowane jako potencjalna przesiadka, a nie jako
+dlugi overlap. Kandydaci sa tez filtrowani radialnie: jezeli promien ze Starego
+Miasta do kandydata biegnie prawie rownolegle po juz wykorzystanym ramieniu,
+punkt nie jest dobrym zaczatkiem nowej nitki. Dodatkowo ramiona nowej linii
+wychodzace ze Starego Miasta sa porownywane z ramionami poprzednich linii, zeby
+trzecia nitka nie wybierala tego samego kierunku tylko dlatego, ze zostalo tam
+jeszcze troche popytu.
+Po przekroczeniu limitu `max_line_overlap_km` overlap jest karany dodatkowo
+przez `line_overlap_excess_penalty_per_km`; analogicznie `max_outside_city_km`
+pilnuje, zeby stala dlugosc linii nie wypychala koncow poza Wroclaw. Konce
+korytarza sa wydluzane asymetrycznie, jezeli po jednej stronie szybciej trafiaja
+poza granice miasta.
 
 ## Uruchomienie
 
